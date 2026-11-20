@@ -441,78 +441,215 @@ def _ensure_title_block(drawing, sheet, sheet_w, scale_text):
     return note + ' Nie udało się dodać pola SCALE.'
 
 
-def _read_view_attr(view, name):
+def _set_param(obj, name, value):
     try:
-        return True, getattr(view, name)
-    except Exception:
-        return False, None
-
-
-def _write_view_attr(view, name, value):
-    try:
-        setattr(view, name, value)
+        setattr(obj, name, value)
         return True
     except Exception:
         return False
 
 
-def _sync_view_style(view, style):
-    """get_style na gotowym rzucie potrafi rzucić. Odczyt, który pada, pomija styl."""
-    readable, current = _read_view_attr(view, 'style')
-    if not readable:
-        return 'Nie odczytano stylu krawędzi. Styl pominięty, rzut zostaje.'
-    if current == style:
-        return None
-    if not _write_view_attr(view, 'style', style):
-        return 'API nie przyjęło zapisu stylu krawędzi.'
-    return None
-
-
-def _sync_view_tangent(view, tangent):
-    readable, current = _read_view_attr(view, 'tangentEdges')
-    if not readable or current == tangent:
-        return None
-    _write_view_attr(view, 'tangentEdges', tangent)
-    return None
-
-
-def _sync_view_scale(view, scale):
-    readable, current = _read_view_attr(view, 'scaleValue')
-    if not readable:
-        return None
+def _view_curve_count(view):
+    """viewCurves nie uruchamia VIEWEDIT. Pusty zbiór znaczy, że rzut nie ma krawędzi modelu."""
     try:
-        unchanged = abs((current or 0.0) - scale) <= 1e-6
+        curves = view.viewCurves
+        return int(curves.count or 0)
     except Exception:
-        return None
-    if unchanged:
-        return None
-    _write_view_attr(view, 'scaleValue', scale)
-    return None
+        return 0
+
+
+def _wait_for_curves(view):
+    for _ in range(40):
+        if _view_curve_count(view) > 0:
+            return True
+        try:
+            adsk.doEvents()
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return _view_curve_count(view) > 0
+
+
+def _geometry_view_count(sheet):
+    try:
+        count = int(sheet.views.count or 0)
+    except Exception:
+        return 0
+    found = 0
+    for index in range(count):
+        try:
+            view = sheet.views.item(index)
+        except Exception:
+            continue
+        if _view_curve_count(view) > 0:
+            found += 1
+    return found
 
 
 def _add_base_view(views, key, scale, style, tangent, x_cm, y_cm):
+    """Styl, skala i styczne idą tylko na wejście. Gotowego rzutu nie czytamy: get_style zdejmuje rzut."""
     view_input = views.createBaseViewInput()
     view_input.placementPoint = adsk.drawing.DrawingPoint.create(
         adsk.core.Point2D.create(x_cm, y_cm)
     )
     parameters = view_input.viewParameters
-    parameters.orientation = _orientation(key)
-    parameters.scaleValue = scale
-    parameters.style = style
-    parameters.tangentEdgesType = tangent
-    parameters.isShowInterferenceEdges = False
+    if not _set_param(parameters, 'orientation', _orientation(key)):
+        raise RuntimeError('Fusion nie przyjął orientacji rzutu {}.'.format(key))
+    _set_param(parameters, 'scaleValue', scale)
+    _set_param(parameters, 'style', style)
+    _set_param(parameters, 'tangentEdgesType', tangent)
     view = views.add(view_input)
     if not view:
         raise RuntimeError('Fusion nie dodał rzutu ({}).'.format(key))
-    notes = []
-    for note in (
-        _sync_view_style(view, style),
-        _sync_view_tangent(view, tangent),
-        _sync_view_scale(view, scale),
-    ):
-        if note:
-            notes.append('{} ({}).'.format(note, key))
-    return notes
+    if not _wait_for_curves(view):
+        raise RuntimeError(
+            'Rzut {} nie ma krawędzi modelu. PDF nie zostanie zapisany.'.format(key)
+        )
+    return view
+
+
+def _point_xy(point):
+    coord = point
+    try:
+        coord = point.coordinate
+    except Exception:
+        pass
+    return float(coord.x), float(coord.y)
+
+
+def _curve_points(view):
+    found = []
+    try:
+        curves = view.viewCurves
+        count = int(curves.count or 0)
+    except Exception:
+        return found
+    for index in range(count):
+        try:
+            curve = curves.item(index)
+        except Exception:
+            continue
+        for name in ('startPoint', 'endPoint', 'midPoint', 'centerPoint'):
+            try:
+                point = getattr(curve, name)
+            except Exception:
+                point = None
+            if not point:
+                continue
+            try:
+                x_cm, y_cm = _point_xy(point)
+            except Exception:
+                continue
+            if math.isfinite(x_cm) and math.isfinite(y_cm):
+                found.append((x_cm, y_cm, point))
+    return found
+
+
+def _extreme_points(points):
+    """Lewy, prawy, dolny i górny punkt z listy (x, y, punkt)."""
+    if len(points) < 2:
+        return None
+    left = min(points, key=lambda item: (item[0], item[1]))
+    right = max(points, key=lambda item: (item[0], -item[1]))
+    bottom = min(points, key=lambda item: (item[1], item[0]))
+    top = max(points, key=lambda item: (item[1], -item[0]))
+    return left, right, bottom, top
+
+
+def _dimension_count(sheet):
+    try:
+        return int(sheet.drawingDimensions.count or 0)
+    except Exception:
+        return 0
+
+
+def _auto_overall(sheet, view):
+    dim_input = sheet.createAutoDimensionInput()
+    dim_input.view = view
+    dim_input.dimensionStrategy = (
+        adsk.drawing.DimensionStrategyTypes.OverallDimensionStrategyType
+    )
+    return bool(sheet.autoDimension(dim_input))
+
+
+def _drawing_point(x_cm, y_cm):
+    return adsk.drawing.DrawingPoint.create(adsk.core.Point2D.create(x_cm, y_cm))
+
+
+def _linear_overall(sheet, view):
+    extremes = _extreme_points(_curve_points(view))
+    if not extremes:
+        return False
+    left, right, bottom, top = extremes
+    dimensions = sheet.drawingDimensions
+    made = False
+    if abs(right[0] - left[0]) > 1e-4:
+        place_y = min(left[1], right[1]) - 0.8
+        dimension = dimensions.addLinearDimension(
+            left[2],
+            right[2],
+            _drawing_point((left[0] + right[0]) / 2.0, place_y),
+            False,
+        )
+        made = made or bool(dimension)
+    if abs(top[1] - bottom[1]) > 1e-4:
+        place_x = min(bottom[0], top[0]) - 0.8
+        dimension = dimensions.addLinearDimension(
+            bottom[2],
+            top[2],
+            _drawing_point(place_x, (bottom[1] + top[1]) / 2.0),
+            False,
+        )
+        made = made or bool(dimension)
+    return made
+
+
+def _dimension_orthographic(sheet, view):
+    before = _dimension_count(sheet)
+    try:
+        if _auto_overall(sheet, view) and _dimension_count(sheet) > before:
+            return 'gabaryt automatyczny'
+    except Exception:
+        pass
+    try:
+        if _linear_overall(sheet, view):
+            return 'gabaryt z krawędzi rzutu'
+    except Exception:
+        return None
+    return None
+
+
+def _wait_for_drawing_idle():
+    """createDrawing wraca, zanim „Automatyzacja rysunku” skończy podmieniać arkusz."""
+    started = time.time()
+    deadline = started + 45.0
+    saw_busy = False
+    while time.time() < deadline:
+        command = ''
+        try:
+            command = ui.activeCommand or ''
+        except Exception:
+            return
+        busy = command not in ('', 'SelectCommand')
+        if busy:
+            saw_busy = True
+        elif saw_busy or time.time() > started + 2.0:
+            return
+        try:
+            adsk.doEvents()
+        except Exception:
+            return
+        time.sleep(0.25)
+
+
+def _active_drawing(fallback):
+    try:
+        drawing_document = adsk.drawing.DrawingDocument.cast(app.activeDocument)
+        if drawing_document and drawing_document.drawing:
+            return drawing_document.drawing
+    except Exception:
+        pass
+    return fallback
 
 
 def _pdf_stem(document):
@@ -766,14 +903,30 @@ def build_drawing(options):
 
     dx, dy, dz = _model_extents(design)
     drawing = _create_drawing(document, options['sheet'])
+    _wait_for_drawing_idle()
+    drawing = _active_drawing(drawing)
+    try:
+        drawing.parentDocument.activate()
+    except Exception:
+        pass
+    try:
+        drawing.parentDocument.updateAllReferences()
+    except Exception:
+        pass
+    try:
+        adsk.doEvents()
+    except Exception:
+        pass
+
     sheet = drawing.activeSheet
     if not sheet:
         raise RuntimeError('Nowy rysunek nie ma arkusza.')
 
+    sheet_error = None
     try:
         _apply_sheet(sheet, options['sheet'])
-    except Exception:
-        pass
+    except Exception as error:
+        sheet_error = error
 
     sheet_w, sheet_h, unit_guess = sheet_size_cm(sheet.width, sheet.height, options['sheet'])
     count = int(options['views'])
@@ -784,6 +937,18 @@ def build_drawing(options):
     style, tangent = _appearance(options['detail'])
 
     warnings = []
+    if sheet_error:
+        warnings.append(
+            'Nie ustawiono arkusza {} poziomo ({}). Zostaje odczytany format: {}.'.format(
+                options['sheet'], sheet_error, unit_guess
+            )
+        )
+    elif unit_guess not in ('mm', 'cm', 'in'):
+        warnings.append(
+            'Szerokość arkusza nie zgadza się z {} poziomo (odczyt: {}).'.format(
+                options['sheet'], unit_guess
+            )
+        )
     if options['detail'] == 'hidden':
         try:
             drawing.documentSettings.viewSettings.hiddenLineLineType = (
@@ -794,30 +959,59 @@ def build_drawing(options):
                 'Nie ustawiono typu linii HIDDEN. Styl rzutu i tak prosi o krawędzie ukryte.'
             )
 
-    if sheet.views.count:
+    try:
+        existing = int(sheet.views.count or 0)
+    except Exception:
+        existing = 0
+    if existing:
         warnings.append(
-            'Arkusz miał już {} rzutów ze szablonu. API widoku nie ma usuwania, '
-            'więc doszły rzuty wybrane w oknie.'.format(sheet.views.count)
+            'Arkusz miał już {} rzutów. API widoku nie ma usuwania, '
+            'więc doszły rzuty wybrane w oknie.'.format(existing)
         )
 
+    created = []
     for item in placed:
-        try:
-            warnings.extend(_add_base_view(
-                sheet.views,
-                item['key'],
-                scale,
-                style,
-                tangent,
-                item['x'],
-                item['y'],
-            ))
-        except Exception as error:
-            warnings.append(
-                'Rzut {} nie został dokończony, PDF i tak powstanie: {}'.format(item['key'], error)
-            )
+        view = _add_base_view(
+            sheet.views,
+            item['key'],
+            scale,
+            style,
+            tangent,
+            item['x'],
+            item['y'],
+        )
+        created.append((item['key'], view))
+
+    if _geometry_view_count(sheet) < count:
+        raise RuntimeError(
+            'Na arkuszu jest {} rzutów z krawędziami modelu, a okno prosiło o {}. '
+            'PDF nie został zapisany.'.format(_geometry_view_count(sheet), count)
+        )
+
+    for key, view in created:
+        if key == 'iso':
+            continue
+        note = _dimension_orthographic(sheet, view)
+        if note:
+            warnings.append('Rzut {}: {}.'.format(key, note))
+        else:
+            warnings.append('Rzut {}: nie udało się dodać wymiarów gabarytowych.'.format(key))
+
+    if _geometry_view_count(sheet) < count:
+        raise RuntimeError(
+            'Rzuty zniknęły przed zapisem PDF. Plik nie został zapisany.'
+        )
 
     scale_text = format_scale(scale)
     title_note = _ensure_title_block(drawing, sheet, sheet_w, scale_text)
+    try:
+        drawing.parentDocument.activate()
+    except Exception:
+        pass
+    try:
+        adsk.doEvents()
+    except Exception:
+        pass
     pdf_path = _export_pdf(drawing, document)
 
     lines = [

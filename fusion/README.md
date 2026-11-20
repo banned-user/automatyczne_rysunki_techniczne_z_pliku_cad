@@ -53,7 +53,7 @@ To układ trzeciego kąta ustawiony współrzędnymi środka każdego rzutu. API
 - Krawędzie widoczne — ten sam styl widocznych krawędzi oraz styczne na pełnej długości (`FullLengthTangentEdgeDisplayType`). Bez krawędzi ukrytych.
 - Widoczne i ukryte — styl `VisibleAndHiddenEdgesDrawingViewStyleType` (opis w dokumentacji: krawędzie widoczne i ukryte, kreskowe) plus styczne na pełnej długości. Dodatkowo `DocumentSettings.viewSettings.hiddenLineLineType` ustawiane jest na `LineTypes.HiddenLineType`. Domyślna wartość tej właściwości to linia ciągła, więc sam styl mógłby nie dać kresek. Nie ustawiam `Hidden2LineType` (osobny wzór HIDDEN2).
 
-Krawędzie interferencji są wyłączone (`isShowInterferenceEdges = False`). Krawędzie gwintu zostają przy domyślnej wartości API (włączone).
+Krawędzie interferencji i gwintu zostają przy domyślnej wartości API. Skrypt nie wyłącza interferencji, żeby prosty model nie stracił krawędzi.
 
 **Arkusz.** A4, A3 albo A2, zawsze poziomo (`LandscapeSheetOrientationType`). Pionowa orientacja nie jest w oknie. Jednostki rysunku: milimetry.
 
@@ -72,8 +72,9 @@ Całe API rysunku jest oznaczone jako podgląd (wersje od lipca do października
 - Nie ma tworzenia rzutu pochodnego, więc nie da się oddać układu trzeciego kąta samej fladze dokumentu.
 - Nie da się ustawić kąta rzutowania.
 - Tabelka: `TitleBlockAttributeParameter` ma nazwę i pozycję, nie treść. Jedyny znacznik podany w pomocy to `SCALE`. Skrypt nie wymyśla znaczników na nazwę pliku, numer arkusza ani datę. Zostawia tabelkę nowego rysunku ISO i, jeśli pola SCALE nie ma, próbuje je dodać. Szkic rysunkowy nie ma tekstu, tylko geometrię.
-- Arkusz powstaje tylko w `AutomaticDrawingCreationMode` (`CreateDrawingInput.creationMode`, domyślnie ten tryb). Pomoc nie ma osobnego typu `DrawingCreationOptions`. Tryb z placeholderami nie jest ustawiany. Gdyby `createDrawing` i tak zgłosiło błąd 3, komunikat wypisuje tryb odczytany z wejścia. Potem skrypt dokłada rzuty z okna. API nie usuwa rzutów, więc rzuty z automatycznego arkusza zostają.
-- Odczyt `view.style` (`get_style`) potrafi rzucić `failed to read view style` na rzucie z automatycznego arkusza. Skrypt wtedy nie czyta stylu dalej, nie przerywa rysunku i zapisuje PDF. Zapis stylu jest tylko wtedy, gdy odczyt się udał i API przyjęło przypisanie.
+- Arkusz powstaje tylko w `AutomaticDrawingCreationMode` (`CreateDrawingInput.creationMode`, domyślnie ten tryb). Pomoc nie ma osobnego typu `DrawingCreationOptions`. Tryb z placeholderami nie jest ustawiany. Gdyby `createDrawing` i tak zgłosiło błąd 3, komunikat wypisuje tryb odczytany z wejścia. Automatyczny arkusz części bywa samą ramką i tabelką. Skrypt czeka, aż polecenie automatyzacji zejdzie, ustawia wybrany format poziomo i sam dokłada widoki bazowe (przód, góra nad nim, prawy z prawej, izometria z boku). API nie usuwa rzutów, więc rzuty, które automatyzacja już wstawiła, zostają.
+- Styl, skala i krawędzie styczne są ustawiane na `ViewParameters` przed `Views.add`. Gotowego rzutu skrypt nie czyta: `view.style` (`get_style`) rzuca `failed to read view style` i ten odczyt zdejmował rzut z arkusza. PDF powstaje dopiero wtedy, gdy każdy żądany rzut ma krzywe modelu (`viewCurves`).
+- Wymiary gabarytowe idą na rzuty prostokątne, nie na izometrię. Najpierw `Sheet.autoDimension` ze strategią `OverallDimensionStrategyType`. Gdy to nic nie doda, skrypt bierze skrajne punkty `viewCurves` i woła `DrawingDimensions.addLinearDimension`.
 - Ukryte kreski zależą od stylu widoku i od `hiddenLineLineType`. Wyglądu kresek (kreska krótka czy długa) nie sprawdzono na wydruku.
 - `Sheet.width` / `Sheet.height` nie podają jednostki. Skrypt poznaje mm, cm albo cale po porównaniu z wymiarem A4/A3/A2. Punkt rzutu jest w centymetrach, jak w opisie `placementPoint`.
 
@@ -103,4 +104,7 @@ Nazwy wywołań są z pomocy otwartej przy pisaniu skryptu, między innymi:
 - [SheetSizes](https://help.autodesk.com/cloudhelp/ENU/Fusion-360-API/files/drawing_SheetSizes.htm)
 - [Export PDF Sample](https://help.autodesk.com/cloudhelp/ENU/Fusion-360-API/files/ExportPDFSample_Sample.htm)
 - [TitleBlock.setAttributes](https://help.autodesk.com/cloudhelp/ENU/Fusion-360-API/files/drawing_TitleBlock_setAttributes.htm)
+- [Sheet.autoDimension](https://help.autodesk.com/cloudhelp/ENU/Fusion-360-API/files/drawing_Sheet_autoDimension.htm)
+- [DrawingDimensions.addLinearDimension](https://help.autodesk.com/cloudhelp/ENU/Fusion-360-API/files/drawing_DrawingDimensions_addLinearDimension.htm)
+- [View](https://help.autodesk.com/cloudhelp/ENU/Fusion-360-API/files/drawing_View.htm)
 - [Working in a Separate Thread](https://help.autodesk.com/cloudhelp/ENU/Fusion-360-API/files/Threading_UM.htm)
