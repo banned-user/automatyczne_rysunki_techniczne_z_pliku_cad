@@ -1,6 +1,6 @@
-# Rysunek ze STEP (skrypt Fusion)
+# Rysunek z otwartego modelu (skrypt Fusion)
 
-Skrypt uruchamiany w Autodesk Fusion na Windows. Wczytuje plik STEP, zakłada nowy model, składa rysunek i zapisuje jeden PDF obok pliku STEP. Nie dotyka aplikacji FreeCAD w tym repozytorium. Nie robi DXF, przekrojów, tolerancji geometrycznych ani listy części.
+Skrypt uruchamiany w Autodesk Fusion na Windows. Bierze model, który jest już otwarty, także niezapisany „(Niezapisany)”, składa rysunek i zapisuje jeden PDF. Nie importuje STEP, nie sprawdza aktywnego projektu i nie zapisuje dokumentu. Nie dotyka aplikacji FreeCAD w tym repozytorium. Nie robi DXF, przekrojów, tolerancji geometrycznych ani listy części.
 
 Folder do skopiowania to `fusion/RysunekZeStep`. Nazwa folderu, pliku `.py` i pliku `.manifest` musi być taka sama: `RysunekZeStep`.
 
@@ -23,21 +23,20 @@ Potem uruchom Fusion od nowa. Skrypt sam pojawia się na liście.
 
 Jeśli folder leży gdzie indziej: **Utilities → Scripts and Add-Ins → Scripts → zielony plus** i wskaż plik `RysunekZeStep.py`. Fusion zapamiętuje to wskazanie.
 
-To jest skrypt (zakładka Scripts, przycisk Run), nie dodatek ładowany przy starcie. Okno jest dialogiem polecenia (`CommandInputs`), bo zwykłe `input()` nie daje list. W API nie ma pola pliku wewnątrz dialogu polecenia, więc obok „Plik STEP” jest przycisk otwierający `FileDialog`.
+To jest skrypt (zakładka Scripts, przycisk Run), nie dodatek ładowany przy starcie. Okno jest dialogiem polecenia (`CommandInputs`), bo zwykłe `input()` nie daje list.
 
 ## Jak uruchomić
 
-1. **Utilities → Scripts and Add-Ins**.
-2. Zakładka **Scripts**.
-3. **Rysunek ze STEP** → **Run**.
-4. Wybierz plik, opcje i OK.
-5. Po OK skrypt importuje STEP, zapisuje model do aktywnego projektu Fusion i dopiero wtedy robi rysunek. Na końcu pojawia się okno ze ścieżką PDF.
+1. Otwórz model w Fusion. Może być niezapisany.
+2. **Utilities → Scripts and Add-Ins**.
+3. Zakładka **Scripts**.
+4. **RysunekZeStep** → **Run**.
+5. Wybierz liczbę rzutów, szczegółowość i arkusz, potem OK.
+6. Po OK skrypt robi rysunek z tego modelu. PDF pyta o miejsce, gdy dokument nie ma lokalnej ścieżki. Na końcu pojawia się okno ze ścieżką PDF.
 
-Model musi trafić do chmury: `DrawingManager.createDrawing` bierze `DataFile`, a nie otwarty, niezapisany dokument. Trzeba być zalogowanym i mieć aktywny projekt. Oficjalny przykład Autodesk mówi to samo.
+Gdy nie ma otwartego modelu, skrypt pokazuje okno i kończy pracę, zanim pojawi się dialog opcji.
 
 ## Opcje
-
-**Plik STEP.** Przycisk „Wybierz plik” otwiera okno plików. Przyjmowane są `.step` i `.stp`. Ścieżka w polu jest tylko do odczytu.
 
 **Liczba rzutów.**
 
@@ -62,15 +61,14 @@ Skala jest jedna dla wszystkich rzutów, z szeregu 100:1 … 1:1 … 1:2, 1:5, 1
 
 Dokumentacja podaje kierunek tylko dla przodu: patrzenie wzdłuż ujemnej osi Z, więc przód pokazuje osie X i Y, ale nie mówi, która jest pozioma. Dla góry i prawego rzutu nie podaje osi. Skala jest liczona ostrożnie: rzut prostokątny rezerwuje największy wymiar modelu w obu kierunkach (przód: większy z X i Y), izometria rezerwuje przekątną przestrzenną prostopadłościanu. Rysunek może mieć więcej pustego miejsca niż przy idealnym dopasowaniu. Tego nie sprawdzono w Fusion.
 
-PDF powstaje obok STEP, z tą samą nazwą i rozszerzeniem `.pdf`. Gdy zapis się nie uda, skrypt pyta o inne miejsce. Grubości linii są włączone, PDF nie otwiera się sam.
+PDF idzie obok dokumentu tylko wtedy, gdy Fusion poda lokalną ścieżkę. Dokument w chmurze i „(Niezapisany)” jej nie mają, więc skrypt pyta, gdzie zapisać PDF. Grubości linii są włączone, PDF nie otwiera się sam.
 
 ## Ograniczenia API
 
 Całe API rysunku jest oznaczone jako podgląd (wersje od lipca do października 2026). Autodesk pisze, że może się zmienić i nie należy na nim opierać programu oddawanego klientom. Innej, stabilnej metody wstawienia rzutów w tej pomocy nie ma.
 
-- Brak pola pliku w `CommandInputs`. Jest lista, pole tekstowe i przycisk oraz osobne `UserInterface.createFileDialog`.
-- Import i zapis dokumentu nie mogą iść wewnątrz zdarzenia polecenia. Okno zostaje po powrocie z `run()` (`autoTerminate(False)` i uchwyty trzymane w zmiennych globalnych). Pętla `doEvents` w `run()` zamykała to okno od razu. Po OK osobny wątek woła `fireCustomEvent`, a import, zapis, rysunek i PDF idą na głównym wątku, gdy polecenie już nie żyje. Skrypt kończy się dopiero wtedy, albo po oknie z błędem. Otwarty dokument „(Niezapisany)” nie jest plikiem źródłowym. Brak aktywnego projektu Fusion jest zgłaszany w oknie, zanim się zamknie.
-- Rysunek wymaga modelu zapisanego w chmurze (`saveAs` do katalogu głównego aktywnego projektu, potem `dataFile`).
+- Okno zostaje po powrocie z `run()` (`autoTerminate(False)` i uchwyty trzymane w zmiennych globalnych). Pętla `doEvents` w `run()` zamykała to okno od razu. Po OK osobny wątek woła `fireCustomEvent`, a rysunek i PDF idą na głównym wątku, gdy polecenie już nie żyje. Komunikat o przedwczesnym zamknięciu nie jest pokazywany: inny powód zakończenia polecenia (błąd OK, wywłaszczenie) nie zamyka skryptu i nie zasłania dialogu.
+- Pomoc `createDrawingInput` opisuje argument jako `DataFile`. Skrypt podaje `dataFile` otwartego dokumentu, gdy Fusion je już ma, a w przeciwnym razie sam otwarty dokument. Nie woła `save`, `saveAs` ani `activeProject`. Gdy to wywołanie się nie uda, okno z błędem pojawia się po zamknięciu dialogu opcji.
 - Nie ma tworzenia rzutu pochodnego, więc nie da się oddać układu trzeciego kąta samej fladze dokumentu.
 - Nie da się ustawić kąta rzutowania.
 - Tabelka: `TitleBlockAttributeParameter` ma nazwę i pozycję, nie treść. Jedyny znacznik podany w pomocy to `SCALE`. Skrypt nie wymyśla znaczników na nazwę pliku, numer arkusza ani datę. Zostawia tabelkę nowego rysunku ISO i, jeśli pola SCALE nie ma, próbuje je dodać. Szkic rysunkowy nie ma tekstu, tylko geometrię.
@@ -90,9 +88,8 @@ Nazwy wywołań są z pomocy otwartej przy pisaniu skryptu, między innymi:
 - [Command Inputs](https://help.autodesk.com/cloudhelp/ENU/Fusion-360-API/files/CommandInputs_UM.htm)
 - [Command Inputs API Sample](https://help.autodesk.com/cloudhelp/ENU/Fusion-360-API/files/CommandInputsSample_Sample.htm)
 - [FileDialog](https://help.autodesk.com/cloudhelp/ENU/Fusion-360-API/files/core_FileDialog.htm)
-- [ImportManager.importToNewDocument](https://help.autodesk.com/cloudhelp/ENU/Fusion-360-API/files/core_ImportManager_importToNewDocument.htm)
-- [ImportManager.createSTEPImportOptions](https://help.autodesk.com/cloudhelp/ENU/Fusion-360-API/files/core_ImportManager_createSTEPImportOptions.htm)
-- [Document.saveAs](https://help.autodesk.com/cloudhelp/ENU/Fusion-360-API/files/core_Document_saveAs.htm)
+- [Application.activeDocument](https://help.autodesk.com/cloudhelp/ENU/Fusion-360-API/files/core_Application_activeDocument.htm)
+- [DrawingManager.createDrawingInput](https://help.autodesk.com/cloudhelp/ENU/Fusion-360-API/files/drawing_DrawingManager_createDrawingInput.htm)
 - [DrawingManager.get](https://help.autodesk.com/cloudhelp/ENU/Fusion-360-API/files/drawing_DrawingManager_get.htm)
 - [Create Automatic Drawing Sample](https://help.autodesk.com/cloudhelp/ENU/Fusion-360-API/files/CreateAutomaticDrawingSample_Sample.htm)
 - [Views.add](https://help.autodesk.com/cloudhelp/ENU/Fusion-360-API/files/drawing_Views_add.htm)

@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Rysunek ze STEP — skrypt Fusion (okno polecenia, nie dodatek).
+"""Rysunek z otwartego modelu — skrypt Fusion (okno polecenia, nie dodatek).
 
 Uruchomienie: Utilities → Scripts and Add-Ins → zakładka Scripts → Run.
 Instrukcja instalacji: fusion/README.md w tym repozytorium.
 
-Skrypt korzysta z podglądowego API rysunków (DrawingManager, Views.add).
+Źródłem jest aktywny model, także niezapisany. Skrypt nie importuje STEP,
+nie sprawdza projektu w chmurze i nie zapisuje dokumentu.
+Korzysta z podglądowego API rysunków (DrawingManager, Views.add).
 Nie został uruchomiony w Fusion na maszynie, na której powstał.
 """
 
@@ -76,6 +78,7 @@ app = None
 ui = None
 dialog_state = {}
 pending_job = None
+source_document = None
 custom_event = None
 job_started = False
 work_started = False
@@ -210,27 +213,13 @@ def place_views(sheet_w, sheet_h, count, extents):
     return scale, placed, fits
 
 
-def document_name_from_step(step_path):
-    stem = os.path.splitext(os.path.basename(step_path))[0]
-    cleaned = []
-    for char in stem:
-        if char.isalnum() or char in ' _-':
-            cleaned.append(char)
-        else:
-            cleaned.append('_')
-    name = ''.join(cleaned).strip(' ._')
-    return name or 'STEP'
-
-
-def pdf_path_beside_step(step_path):
-    folder, filename = os.path.split(step_path)
-    stem = os.path.splitext(filename)[0] or 'rysunek'
-    return os.path.join(folder, stem + '.pdf')
+class PdfCancelled(Exception):
+    pass
 
 
 def _message(text):
     if ui:
-        ui.messageBox(text, 'Rysunek ze STEP')
+        ui.messageBox(text, 'Rysunek z modelu')
 
 
 def _finish():
@@ -270,7 +259,7 @@ def _defer_fire():
             0,
             'Nie udało się wznowić skryptu po zamknięciu okna. '
             'Zostaw Fusion otwarty i uruchom skrypt jeszcze raz.',
-            'Rysunek ze STEP',
+            'Rysunek z modelu',
             0,
         )
     except Exception:
@@ -284,6 +273,8 @@ def _start_work():
     work_started = True
     try:
         build_drawing(pending_job)
+    except PdfCancelled:
+        _message('Nie zapisano PDF.')
     except Exception:
         _message('Nie udało się utworzyć rysunku:\n{}'.format(traceback.format_exc()))
     _finish()
@@ -304,35 +295,7 @@ def _register_job_event():
     HANDLERS.append(custom_event)
 
 
-def _require_cloud_project():
-    """Rysunek API bierze DataFile z chmury. Otwarty niezapisany dokument nie jest źródłem."""
-    project = None
-    folder = None
-    try:
-        project = app.data.activeProject
-        folder = project.rootFolder if project else None
-    except Exception:
-        project = None
-        folder = None
-    if not project or not folder:
-        raise ValueError(
-            'Brak aktywnego projektu Fusion. Zaloguj się i wybierz projekt.\n'
-            'Otwarty dokument „(Niezapisany)” nie jest plikiem STEP i nie musi być zapisany. '
-            'Skrypt zakłada nowy model ze wskazanego pliku i zapisuje go w projekcie, '
-            'bo rysunek da się utworzyć tylko z modelu w chmurze.'
-        )
-
-
 def _read_options():
-    path = dialog_state['path'].value.strip()
-    if not path:
-        raise ValueError('Wybierz plik STEP.')
-    lower = path.lower()
-    if not (lower.endswith('.step') or lower.endswith('.stp')):
-        raise ValueError('Plik musi mieć rozszerzenie .step lub .stp.')
-    if not os.path.isfile(path):
-        raise ValueError('Nie ma takiego pliku:\n{}'.format(path))
-
     view_item = dialog_state['views'].selectedItem
     detail_item = dialog_state['detail'].selectedItem
     sheet_item = dialog_state['sheet'].selectedItem
@@ -345,29 +308,32 @@ def _read_options():
     if sheet_item.name not in SHEET_LABELS:
         raise ValueError('Nieznany arkusz.')
 
-    _require_cloud_project()
-
     return {
-        'step': path,
         'views': VIEW_LABELS[view_item.name],
         'detail': DETAIL_LABELS[detail_item.name],
         'sheet': SHEET_LABELS[sheet_item.name],
     }
 
 
-def _choose_step_file():
-    dialog = ui.createFileDialog()
-    dialog.title = 'Plik STEP'
-    dialog.filter = 'Pliki STEP (*.step;*.stp)'
-    dialog.filterIndex = 0
-    dialog.isMultiSelectEnabled = False
-    current = dialog_state['path'].value.strip()
-    if current:
-        dialog.initialDirectory = os.path.dirname(current)
-        dialog.initialFilename = os.path.basename(current)
-    if dialog.showOpen() != adsk.core.DialogResults.DialogOK:
-        return
-    dialog_state['path'].value = dialog.filename
+def _design_from_document(document):
+    if not document:
+        return None
+    try:
+        product = document.products.itemByProductType('DesignProductType')
+    except Exception:
+        return None
+    return adsk.fusion.Design.cast(product)
+
+
+def _active_design():
+    document = app.activeDocument if app else None
+    design = _design_from_document(document)
+    if design:
+        return document, design
+    design = _design_from_document(source_document)
+    if design:
+        return source_document, design
+    return None, None
 
 
 def _appearance(detail):
@@ -392,45 +358,13 @@ def _orientation(key):
     }[key]
 
 
-def _wait_for_data_file(document):
-    data_file = document.dataFile
-    if data_file:
-        return data_file
-    deadline = time.time() + 90.0
-    while time.time() < deadline:
-        adsk.doEvents()
-        time.sleep(0.25)
+def _drawing_source(document):
+    """Źródło rysunku to otwarty dokument. Zapis i projekt w chmurze nie są wymagane."""
+    try:
         data_file = document.dataFile
-        if data_file:
-            return data_file
-    return None
-
-
-def _save_design(document, step_path):
-    """Zapis do aktywnego projektu Fusion. createDrawing wymaga DataFile w chmurze."""
-    project = app.data.activeProject
-    if not project:
-        raise RuntimeError(
-            'Brak aktywnego projektu Fusion. Zaloguj się i wybierz projekt, '
-            'potem uruchom skrypt ponownie.'
-        )
-    folder = project.rootFolder
-    description = 'Import STEP do rysunku PDF'
-    name = document_name_from_step(step_path)
-    if not document.saveAs(name, folder, description, ''):
-        stamped = '{} {}'.format(name, time.strftime('%Y%m%d-%H%M%S'))
-        if not document.saveAs(stamped, folder, description, ''):
-            raise RuntimeError(
-                'Nie udało się zapisać zaimportowanego modelu do projektu Fusion. '
-                'Rysunek API tworzy się tylko z pliku zapisanego w chmurze.'
-            )
-    data_file = _wait_for_data_file(document)
-    if not data_file:
-        raise RuntimeError(
-            'Model został zapisany, ale Fusion nie zwrócił jeszcze pliku danych '
-            '(DataFile). Poczekaj chwilę i uruchom skrypt ponownie na tym samym STEP.'
-        )
-    return data_file
+    except Exception:
+        data_file = None
+    return data_file if data_file else document
 
 
 def _model_extents(design):
@@ -441,7 +375,7 @@ def _model_extents(design):
     if not all(math.isfinite(value) for value in (dx, dy, dz)):
         raise RuntimeError('Nie da się odczytać gabarytu modelu.')
     if max(dx, dy, dz) <= 1e-6:
-        raise RuntimeError('Zaimportowany model nie ma geometrii do narysowania.')
+        raise RuntimeError('Otwarty model nie ma geometrii do narysowania.')
     return dx, dy, dz
 
 
@@ -531,24 +465,55 @@ def _add_base_view(views, key, scale, style, tangent, x_cm, y_cm):
     return view
 
 
-def _export_pdf(drawing, step_path):
-    target = pdf_path_beside_step(step_path)
-    if _write_pdf(drawing, target):
-        return target
+def _pdf_stem(document):
+    raw = ''
+    try:
+        raw = document.name or ''
+    except Exception:
+        raw = ''
+    cleaned = []
+    for char in raw:
+        if char in '<>:"/\\|?*' or ord(char) < 32:
+            cleaned.append('_')
+        else:
+            cleaned.append(char)
+    name = ''.join(cleaned).strip(' ._')
+    return name or 'rysunek'
 
+
+def _document_pdf_path(document):
+    """Lokalna ścieżka obok dokumentu, jeśli Fusion ją w ogóle ma. Niezapisany model jej nie ma."""
+    for attr in ('path', 'pathName', 'fullPath'):
+        try:
+            value = getattr(document, attr)
+        except Exception:
+            continue
+        if isinstance(value, str) and value and os.path.isabs(value):
+            folder = value if os.path.isdir(value) else os.path.dirname(value)
+            if folder and os.path.isdir(folder):
+                return os.path.join(folder, _pdf_stem(document) + '.pdf')
+    return None
+
+
+def _ask_pdf_path(document):
     dialog = ui.createFileDialog()
     dialog.title = 'Zapisz PDF'
     dialog.filter = 'PDF (*.pdf)'
     dialog.filterIndex = 0
-    dialog.initialDirectory = os.path.dirname(target)
-    dialog.initialFilename = os.path.basename(target)
+    dialog.initialFilename = _pdf_stem(document) + '.pdf'
     if dialog.showSave() != adsk.core.DialogResults.DialogOK:
-        raise RuntimeError(
-            'Nie udało się zapisać PDF obok pliku STEP, a wybór innego miejsca został anulowany.'
-        )
+        raise PdfCancelled()
     chosen = dialog.filename
     if not chosen.lower().endswith('.pdf'):
         chosen += '.pdf'
+    return chosen
+
+
+def _export_pdf(drawing, document):
+    target = _document_pdf_path(document)
+    if target and _write_pdf(drawing, target):
+        return target
+    chosen = _ask_pdf_path(document)
     if not _write_pdf(drawing, chosen):
         raise RuntimeError('Eksport PDF nie powiódł się:\n{}'.format(chosen))
     return chosen
@@ -563,16 +528,25 @@ def _write_pdf(drawing, path):
     return bool(export_manager.execute(options))
 
 
-def _create_drawing(data_file, sheet_key):
+def _create_drawing(document, sheet_key):
     manager = adsk.drawing.DrawingManager.get()
     if not manager:
         raise RuntimeError('Fusion nie zwrócił DrawingManager.')
-    drawing_input = manager.createDrawingInput(
-        data_file,
-        adsk.drawing.DrawingCreationModes.ManualDrawingCreationMode,
-    )
+    try:
+        drawing_input = manager.createDrawingInput(
+            _drawing_source(document),
+            adsk.drawing.DrawingCreationModes.ManualDrawingCreationMode,
+        )
+    except Exception as error:
+        raise RuntimeError(
+            'Nie udało się przygotować rysunku z otwartego modelu.\n'
+            'Skrypt nie zapisywał dokumentu i nie wybierał projektu.\n{}'.format(error)
+        )
     if not drawing_input:
-        raise RuntimeError('Nie udało się przygotować rysunku.')
+        raise RuntimeError(
+            'Fusion nie przygotował rysunku z otwartego modelu. '
+            'Skrypt nie zapisywał dokumentu i nie wybierał projektu.'
+        )
 
     sizes = {
         'A4': adsk.drawing.SheetSizes.A4ISOSheetSize,
@@ -589,8 +563,8 @@ def _create_drawing(data_file, sheet_key):
     drawing_file = manager.createDrawing(drawing_input)
     if not drawing_file:
         raise RuntimeError(
-            'Tworzenie rysunku nie zwróciło pliku. API rysunków jest w podglądzie '
-            'i wymaga zapisanego modelu.'
+            'Tworzenie rysunku z otwartego modelu nie zwróciło pliku. '
+            'Skrypt nie zapisywał dokumentu i nie wybierał projektu.'
         )
     opened = app.documents.open(drawing_file, True)
     drawing_document = adsk.drawing.DrawingDocument.cast(opened)
@@ -628,29 +602,23 @@ def build_drawing(options):
             select_command.execute()
             adsk.doEvents()
 
-    step_path = options['step']
-    _message(
-        'Importuję STEP i tworzę rysunek.\n'
-        'Otwarty, niezapisany dokument jest pomijany. Nowy model ze STEP zostanie zapisany '
-        'w aktywnym projekcie Fusion. Po kliknięciu OK poczekaj na kolejne okno.'
-    )
-
-    importer = app.importManager
-    step_options = importer.createSTEPImportOptions(step_path)
-    step_options.isViewFit = True
-    design_document = importer.importToNewDocument(step_options)
-    if not design_document:
-        raise RuntimeError('Import STEP nie utworzył dokumentu.')
-
-    design = adsk.fusion.Design.cast(
-        design_document.products.itemByProductType('DesignProductType')
-    )
+    document, design = _active_design()
     if not design:
-        raise RuntimeError('Zaimportowany dokument nie jest modelem Fusion.')
+        _message('Nie ma otwartego modelu. Otwórz model w Fusion i uruchom skrypt ponownie.')
+        return
+
+    try:
+        document.activate()
+    except Exception:
+        pass
+
+    _message(
+        'Tworzę rysunek z otwartego modelu.\n'
+        'Dokument nie jest zapisywany. Po kliknięciu OK poczekaj na okno zapisu PDF.'
+    )
 
     dx, dy, dz = _model_extents(design)
-    data_file = _save_design(design_document, step_path)
-    drawing = _create_drawing(data_file, options['sheet'])
+    drawing = _create_drawing(document, options['sheet'])
     sheet = drawing.activeSheet
     if not sheet:
         raise RuntimeError('Nowy rysunek nie ma arkusza.')
@@ -698,7 +666,7 @@ def build_drawing(options):
 
     scale_text = format_scale(scale)
     title_note = _ensure_title_block(drawing, sheet, sheet_w, scale_text)
-    pdf_path = _export_pdf(drawing, step_path)
+    pdf_path = _export_pdf(drawing, document)
 
     lines = [
         'Zapisano PDF:',
@@ -724,24 +692,18 @@ class CreatedHandler(adsk.core.CommandCreatedEventHandler):
     def notify(self, args):
         try:
             command = adsk.core.CommandCreatedEventArgs.cast(args).command
-            command.setDialogInitialSize(520, 420)
+            command.setDialogInitialSize(480, 280)
             inputs = command.commandInputs
 
             inputs.addTextBoxCommandInput(
                 'wstep',
                 '',
-                'Import STEP do nowego modelu, rysunek ISO i jeden PDF obok pliku STEP. '
-                'Otwarty, niezapisany dokument jest pomijany. '
-                'Bez przekrojów, tolerancji geometrycznych i listy części.',
-                4,
+                'Rysunek z otwartego modelu, także niezapisany. '
+                'Bez importu STEP, bez zapisu do chmury, bez przekrojów, '
+                'tolerancji geometrycznych i listy części.',
+                3,
                 True,
             )
-
-            path_input = inputs.addStringValueInput('plikStep', 'Plik STEP', '')
-            path_input.isReadOnly = True
-            dialog_state['path'] = path_input
-
-            inputs.addBoolValueInput('wybierzPlik', 'Wybierz plik', False, '', False)
 
             views = inputs.addDropDownCommandInput(
                 'liczbaRzutow',
@@ -784,31 +746,12 @@ class CreatedHandler(adsk.core.CommandCreatedEventHandler):
             command.execute.add(on_execute)
             HANDLERS.append(on_execute)
 
-            on_input = InputChangedHandler()
-            command.inputChanged.add(on_input)
-            HANDLERS.append(on_input)
-
             on_destroy = DestroyHandler()
             command.destroy.add(on_destroy)
             HANDLERS.append(on_destroy)
             dialog_state['ready'] = True
         except Exception:
             _message('Nie udało się zbudować okna:\n{}'.format(traceback.format_exc()))
-
-
-class InputChangedHandler(adsk.core.InputChangedEventHandler):
-    def __init__(self):
-        super().__init__()
-
-    def notify(self, args):
-        try:
-            if not dialog_state.get('ready'):
-                return
-            changed = adsk.core.InputChangedEventArgs.cast(args).input
-            if changed and changed.id == 'wybierzPlik':
-                _choose_step_file()
-        except Exception:
-            _message('Nie udało się wybrać pliku:\n{}'.format(traceback.format_exc()))
 
 
 class ExecuteHandler(adsk.core.CommandEventHandler):
@@ -830,6 +773,28 @@ class ExecuteHandler(adsk.core.CommandEventHandler):
             event_args.executeFailedMessage = traceback.format_exc()
 
 
+def _reason_value(reason):
+    names = (
+        'UnknownTerminationReason',
+        'CompletedTerminationReason',
+        'CancelledTerminationReason',
+        'AbortedTerminationReason',
+        'PreEmptedTerminationReason',
+        'SessionEndingTerminationReason',
+    )
+    for value, name in enumerate(names):
+        expected = getattr(adsk.core.CommandTerminationReason, name, None)
+        if expected is not None and reason == expected:
+            return value
+    try:
+        number = int(reason)
+    except Exception:
+        return -1
+    if 0 <= number <= 5:
+        return number
+    return -1
+
+
 class DestroyHandler(adsk.core.CommandEventHandler):
     def __init__(self):
         super().__init__()
@@ -837,28 +802,17 @@ class DestroyHandler(adsk.core.CommandEventHandler):
     def notify(self, args):
         global job_started
         try:
-            reason = adsk.core.CommandEventArgs.cast(args).terminationReason
+            reason = _reason_value(adsk.core.CommandEventArgs.cast(args).terminationReason)
         except Exception:
-            _message('Błąd przy zamykaniu okna:\n{}'.format(traceback.format_exc()))
-            _finish()
             return
-        completed = reason == adsk.core.CommandTerminationReason.CompletedTerminationReason
-        if completed and pending_job and not job_started:
-            # Nie twórz dokumentów w tym zdarzeniu. Wątek odpala pracę,
-            # gdy polecenie już nie trzyma transakcji.
+        # 1 = OK i wykonanie się udało. 2 = Anuluj.
+        # Inny powód (także błąd OK) zostawia okno w spokoju: bez komunikatu i bez terminate.
+        if reason == 1 and pending_job and not job_started:
             job_started = True
             threading.Thread(target=_defer_fire, daemon=True).start()
             return
-        if reason == adsk.core.CommandTerminationReason.CancelledTerminationReason:
+        if reason == 2:
             _finish()
-            return
-        if reason == adsk.core.CommandTerminationReason.AbortedTerminationReason:
-            return
-        _message(
-            'Okno skryptu zamknęło się przed OK.\n'
-            'Nic nie zostało zapisane. Uruchom skrypt jeszcze raz.'
-        )
-        _finish()
 
 
 class JobHandler(adsk.core.CustomEventHandler):
@@ -870,10 +824,11 @@ class JobHandler(adsk.core.CustomEventHandler):
 
 
 def run(_context):
-    global app, ui, pending_job, job_started, work_started, script_finished
+    global app, ui, pending_job, source_document, job_started, work_started, script_finished
     app = adsk.core.Application.get()
     ui = app.userInterface if app else None
     pending_job = None
+    source_document = None
     job_started = False
     work_started = False
     script_finished = False
@@ -881,6 +836,11 @@ def run(_context):
     try:
         if not app or not ui:
             return
+        document, design = _active_design()
+        if not design:
+            _message('Nie ma otwartego modelu. Otwórz model w Fusion i uruchom skrypt ponownie.')
+            return
+        source_document = document
         # Skrypt ma zostać w pamięci po powrocie z run(). Okno polecenia
         # żyje tylko wtedy, gdy run() odda wątek Fusionowi. Pętla doEvents
         # w run() zamyka to okno od razu.
@@ -894,8 +854,8 @@ def run(_context):
 
         command_def = ui.commandDefinitions.addButtonDefinition(
             CMD_ID,
-            'Rysunek ze STEP',
-            'Importuje plik STEP i zapisuje rysunek PDF.',
+            'Rysunek z modelu',
+            'Tworzy rysunek PDF z otwartego modelu, bez importu i bez zapisu.',
         )
         HANDLERS.append(command_def)
         on_created = CreatedHandler()
