@@ -10,6 +10,7 @@ Nie został uruchomiony w Fusion na maszynie, na której powstał.
 
 import math
 import os
+import threading
 import time
 import traceback
 
@@ -18,6 +19,7 @@ import adsk.drawing
 import adsk.fusion
 
 CMD_ID = 'RysunekZeStepCmd'
+EVENT_ID = 'RysunekZeStepJob'
 HANDLERS = []
 
 # Skale z szeregu ISO 5455, od największej. Wybierana jest największa, która
@@ -74,8 +76,10 @@ app = None
 ui = None
 dialog_state = {}
 pending_job = None
-dialog_closed = False
-dialog_accepted = False
+custom_event = None
+job_started = False
+work_started = False
+script_finished = False
 
 
 def largest_standard_scale(max_scale):
@@ -230,13 +234,74 @@ def _message(text):
 
 
 def _finish():
+    global custom_event, script_finished
+    if script_finished:
+        return
+    script_finished = True
     try:
-        command_def = ui.commandDefinitions.itemById(CMD_ID)
-        if command_def:
-            command_def.deleteMe()
+        if app:
+            app.unregisterCustomEvent(EVENT_ID)
+    except Exception:
+        pass
+    custom_event = None
+    try:
+        if ui:
+            command_def = ui.commandDefinitions.itemById(CMD_ID)
+            if command_def:
+                command_def.deleteMe()
     except Exception:
         pass
     adsk.terminate()
+
+
+def _defer_fire():
+    """Wołane z wątku roboczego. Jedyna dozwolona funkcja Fusion to fireCustomEvent."""
+    time.sleep(0.4)
+    for _ in range(40):
+        try:
+            if app and app.fireCustomEvent(EVENT_ID, 'go'):
+                return
+        except Exception:
+            pass
+        time.sleep(0.25)
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(
+            0,
+            'Nie udało się wznowić skryptu po zamknięciu okna. '
+            'Zostaw Fusion otwarty i uruchom skrypt jeszcze raz.',
+            'Rysunek ze STEP',
+            0,
+        )
+    except Exception:
+        pass
+
+
+def _start_work():
+    global work_started
+    if work_started or not pending_job:
+        return
+    work_started = True
+    try:
+        build_drawing(pending_job)
+    except Exception:
+        _message('Nie udało się utworzyć rysunku:\n{}'.format(traceback.format_exc()))
+    _finish()
+
+
+def _register_job_event():
+    global custom_event
+    try:
+        app.unregisterCustomEvent(EVENT_ID)
+    except Exception:
+        pass
+    custom_event = app.registerCustomEvent(EVENT_ID)
+    if not custom_event:
+        raise RuntimeError('Fusion nie zarejestrował zdarzenia skryptu.')
+    on_job = JobHandler()
+    custom_event.add(on_job)
+    HANDLERS.append(on_job)
+    HANDLERS.append(custom_event)
 
 
 def _require_cloud_project():
@@ -770,62 +835,94 @@ class DestroyHandler(adsk.core.CommandEventHandler):
         super().__init__()
 
     def notify(self, args):
-        global dialog_closed, dialog_accepted
+        global job_started
         try:
             reason = adsk.core.CommandEventArgs.cast(args).terminationReason
-            dialog_accepted = (
-                reason == adsk.core.CommandTerminationReason.CompletedTerminationReason
-                and pending_job is not None
-            )
         except Exception:
-            dialog_accepted = False
             _message('Błąd przy zamykaniu okna:\n{}'.format(traceback.format_exc()))
-        dialog_closed = True
+            _finish()
+            return
+        completed = reason == adsk.core.CommandTerminationReason.CompletedTerminationReason
+        if completed and pending_job and not job_started:
+            # Nie twórz dokumentów w tym zdarzeniu. Wątek odpala pracę,
+            # gdy polecenie już nie trzyma transakcji.
+            job_started = True
+            threading.Thread(target=_defer_fire, daemon=True).start()
+            return
+        if reason == adsk.core.CommandTerminationReason.CancelledTerminationReason:
+            _finish()
+            return
+        if reason == adsk.core.CommandTerminationReason.AbortedTerminationReason:
+            return
+        _message(
+            'Okno skryptu zamknęło się przed OK.\n'
+            'Nic nie zostało zapisane. Uruchom skrypt jeszcze raz.'
+        )
+        _finish()
+
+
+class JobHandler(adsk.core.CustomEventHandler):
+    def __init__(self):
+        super().__init__()
+
+    def notify(self, args):
+        _start_work()
 
 
 def run(_context):
-    global app, ui, pending_job, dialog_closed, dialog_accepted
+    global app, ui, pending_job, job_started, work_started, script_finished
     app = adsk.core.Application.get()
     ui = app.userInterface if app else None
     pending_job = None
-    dialog_closed = False
-    dialog_accepted = False
+    job_started = False
+    work_started = False
+    script_finished = False
     dialog_state.clear()
     try:
         if not app or not ui:
             return
+        # Skrypt ma zostać w pamięci po powrocie z run(). Okno polecenia
+        # żyje tylko wtedy, gdy run() odda wątek Fusionowi. Pętla doEvents
+        # w run() zamyka to okno od razu.
+        adsk.autoTerminate(False)
 
         existing = ui.commandDefinitions.itemById(CMD_ID)
         if existing:
             existing.deleteMe()
+
+        _register_job_event()
 
         command_def = ui.commandDefinitions.addButtonDefinition(
             CMD_ID,
             'Rysunek ze STEP',
             'Importuje plik STEP i zapisuje rysunek PDF.',
         )
+        HANDLERS.append(command_def)
         on_created = CreatedHandler()
         command_def.commandCreated.add(on_created)
         HANDLERS.append(on_created)
         command_def.execute()
-        # run() musi żyć do zamknięcia okna. Po powrocie z run() znika zdarzenie
-        # własne i fireCustomEvent zwraca fałsz, zanim import w ogóle ruszy.
-        adsk.autoTerminate(False)
-        if not dialog_state.get('ready'):
-            dialog_closed = True
-        while not dialog_closed:
-            adsk.doEvents()
-            if dialog_closed:
-                break
-            time.sleep(0.05)
-        for _ in range(3):
-            adsk.doEvents()
-        if dialog_accepted and pending_job:
-            try:
-                build_drawing(pending_job)
-            except Exception:
-                _message('Nie udało się utworzyć rysunku:\n{}'.format(traceback.format_exc()))
-        _finish()
+
+        # execute() zwykle wraca od razu i okno zostaje. Jeśli w tej wersji
+        # Fusion czeka w execute() aż do OK, dialog jest już zamknięty i
+        # pracę trzeba dokończyć tutaj, zanim run() się skończy.
+        if job_started:
+            deadline = time.time() + 8.0
+            while not work_started and time.time() < deadline:
+                adsk.doEvents()
+                time.sleep(0.05)
+            if not work_started:
+                _start_work()
     except Exception:
         _message('Nie udało się uruchomić skryptu:\n{}'.format(traceback.format_exc()))
         _finish()
+
+
+def stop(_context):
+    global custom_event
+    try:
+        if app:
+            app.unregisterCustomEvent(EVENT_ID)
+    except Exception:
+        pass
+    custom_event = None
