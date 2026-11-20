@@ -539,107 +539,23 @@ def _sheet_sizes():
     }
 
 
-def _data_file_label(data_file):
-    name = ''
-    extension = ''
+def _automatic_mode():
+    return adsk.drawing.DrawingCreationModes.AutomaticDrawingCreationMode
+
+
+def _mode_label(drawing_input):
+    automatic = _automatic_mode()
     try:
-        name = data_file.name or ''
-    except Exception:
-        name = ''
+        mode = drawing_input.creationMode
+    except Exception as error:
+        return 'nie odczytano ({})'.format(error)
+    if mode == automatic:
+        return 'AutomaticDrawingCreationMode'
     try:
-        extension = (data_file.fileExtension or '').lower().lstrip('.')
+        shown = int(mode)
     except Exception:
-        extension = ''
-    return name, extension
-
-
-def _is_sheet_template(data_file, sheet_key):
-    name, extension = _data_file_label(data_file)
-    if extension != 'f2t':
-        return False
-    lower = name.lower()
-    if sheet_key.lower() not in lower:
-        return False
-    return any(token in lower for token in ('iso', 'template', 'szablon', 'arkusz'))
-
-
-def _template_has_view_placeholders(data_file):
-    """Otwiera szablon i sprawdza, czy są na nim rzuty. Bez tego tryb ręczny nie jest wołany."""
-    opened = None
-    try:
-        opened = app.documents.open(data_file, False)
-        document = adsk.drawing.DrawingDocument.cast(opened)
-        if not document or not document.drawing:
-            return False
-        sheet = document.drawing.activeSheet
-        return bool(sheet and sheet.views and sheet.views.count > 0)
-    except Exception:
-        return False
-    finally:
-        try:
-            if opened:
-                opened.close(False)
-        except Exception:
-            pass
-
-
-def _iter_data_files(limit):
-    seen = 0
-    try:
-        hubs = app.data.dataHubs
-        hub_count = hubs.count
-    except Exception:
-        return
-    for hub_index in range(hub_count):
-        try:
-            projects = hubs.item(hub_index).dataProjects
-            project_count = projects.count
-        except Exception:
-            continue
-        for project_index in range(project_count):
-            try:
-                stack = [projects.item(project_index).rootFolder]
-            except Exception:
-                continue
-            while stack and seen < limit:
-                folder = stack.pop()
-                try:
-                    files = folder.dataFiles
-                    file_count = files.count
-                except Exception:
-                    file_count = 0
-                    files = None
-                for file_index in range(file_count):
-                    seen += 1
-                    try:
-                        yield files.item(file_index)
-                    except Exception:
-                        continue
-                    if seen >= limit:
-                        return
-                try:
-                    folders = folder.dataFolders
-                    folder_count = folders.count
-                except Exception:
-                    folder_count = 0
-                    folders = None
-                for folder_index in range(folder_count):
-                    try:
-                        stack.append(folders.item(folder_index))
-                    except Exception:
-                        continue
-
-
-def _sheet_template_with_placeholders(sheet_key):
-    try:
-        for data_file in _iter_data_files(120):
-            if not _is_sheet_template(data_file, sheet_key):
-                continue
-            if _template_has_view_placeholders(data_file):
-                return data_file
-    except Exception:
-        return None
-    return None
+        shown = mode
+    return 'nie AutomaticDrawingCreationMode ({})'.format(shown)
 
 
 def _apply_sheet_settings(drawing_input, sheet_key):
@@ -678,26 +594,42 @@ def _configure_standard_sheet(drawing_input):
         pass
 
 
-def _prepare_drawing_input(manager, document, sheet_key, template_file):
-    manual = adsk.drawing.DrawingCreationModes.ManualDrawingCreationMode
-    automatic = adsk.drawing.DrawingCreationModes.AutomaticDrawingCreationMode
-    # Tryb ręczny tylko ze szablonem, na którym są już rzuty-placeholdery.
-    mode = manual if template_file else automatic
-    drawing_input = manager.createDrawingInput(_drawing_source(document), mode)
+def _prepare_drawing_input(manager, document, sheet_key):
+    """CreateDrawingInput w trybie automatycznym. Pomoc nie ma osobnego DrawingCreationOptions.
+
+    Tryb jest argumentem createDrawingInput i właściwością creationMode.
+    Domyślna wartość tej właściwości to AutomaticDrawingCreationMode.
+    Szablon i tryb z placeholderami nie są ustawiane.
+    """
+    automatic = _automatic_mode()
+    drawing_input = manager.createDrawingInput(_drawing_source(document), automatic)
     if not drawing_input:
         raise RuntimeError(
             'Fusion nie przygotował rysunku z otwartego modelu. '
             'Skrypt nie zapisywał dokumentu i nie wybierał projektu.'
         )
     _apply_sheet_settings(drawing_input, sheet_key)
-    drawing_input.creationMode = mode
-    if template_file:
-        drawing_input.baseDocumentType = adsk.drawing.BaseDocumentTypes.FromTemplateBaseDocumentType
-        drawing_input.templateFile = template_file
-    else:
-        drawing_input.baseDocumentType = adsk.drawing.BaseDocumentTypes.FromScratchBaseDocumentType
-        _configure_standard_sheet(drawing_input)
-    return drawing_input
+    drawing_input.baseDocumentType = adsk.drawing.BaseDocumentTypes.FromScratchBaseDocumentType
+    drawing_input.creationMode = automatic
+    try:
+        drawing_input.sheetCreationType = (
+            adsk.drawing.SheetCreationTypes.FirstLevelOnlySheetCreationType
+        )
+    except Exception:
+        pass
+    try:
+        drawing_input.content = adsk.drawing.DrawingContentTypes.FullAssemblyDrawingContentType
+    except Exception:
+        pass
+    _configure_standard_sheet(drawing_input)
+    drawing_input.creationMode = automatic
+    label = _mode_label(drawing_input)
+    if drawing_input.creationMode != automatic:
+        raise RuntimeError(
+            'Fusion nie przyjął trybu automatycznego, więc createDrawing nie zostało wywołane.\n'
+            'Tryb tworzenia: {}.'.format(label)
+        )
+    return drawing_input, label
 
 
 def _open_drawing_file(drawing_file):
@@ -716,44 +648,27 @@ def _create_drawing(document, sheet_key):
     if not manager:
         raise RuntimeError('Fusion nie zwrócił DrawingManager.')
 
-    template_file = _sheet_template_with_placeholders(sheet_key)
     try:
         document.activate()
     except Exception:
         pass
-    use_template = template_file is not None
-    drawing_input = _prepare_drawing_input(
-        manager, document, sheet_key, template_file if use_template else None
-    )
 
+    drawing_input, mode_label = _prepare_drawing_input(manager, document, sheet_key)
     try:
         drawing_file = manager.createDrawing(drawing_input)
     except Exception as error:
-        message = str(error)
-        if use_template and 'placeholder' in message.lower():
-            drawing_input = _prepare_drawing_input(manager, document, sheet_key, None)
-            use_template = False
-            drawing_file = manager.createDrawing(drawing_input)
-        else:
-            raise RuntimeError(
-                'Nie udało się utworzyć rysunku z otwartego modelu.\n'
-                'Skrypt nie zapisywał dokumentu i nie wybierał projektu.\n{}'.format(error)
-            )
+        raise RuntimeError(
+            'Nie udało się utworzyć rysunku z otwartego modelu.\n'
+            'Tryb tworzenia: {}.\n'
+            'Skrypt nie zapisywał dokumentu i nie wybierał projektu.\n{}'.format(mode_label, error)
+        )
     if not drawing_file:
         raise RuntimeError(
-            'Tworzenie rysunku z otwartego modelu nie zwróciło pliku. '
-            'Skrypt nie zapisywał dokumentu i nie wybierał projektu.'
+            'Tworzenie rysunku z otwartego modelu nie zwróciło pliku.\n'
+            'Tryb tworzenia: {}.\n'
+            'Skrypt nie zapisywał dokumentu i nie wybierał projektu.'.format(mode_label)
         )
-    if use_template:
-        template_name = _data_file_label(template_file)[0] or sheet_key
-        last_drawing_note = (
-            'Szablon {} z placeholderami rzutów: {}.'.format(sheet_key, template_name)
-        )
-    else:
-        last_drawing_note = (
-            'Arkusz {} ISO poziomo ze standardowego formatu Fusion. '
-            'Tryb ręczny nie został wywołany, bo ten format nie ma placeholderów rzutów.'.format(sheet_key)
-        )
+    last_drawing_note = 'Arkusz {} ISO poziomo. Tryb tworzenia: {}.'.format(sheet_key, mode_label)
     return _open_drawing_file(drawing_file)
 
 

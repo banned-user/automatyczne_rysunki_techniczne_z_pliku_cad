@@ -72,7 +72,7 @@ Całe API rysunku jest oznaczone jako podgląd (wersje od lipca do października
 - Nie ma tworzenia rzutu pochodnego, więc nie da się oddać układu trzeciego kąta samej fladze dokumentu.
 - Nie da się ustawić kąta rzutowania.
 - Tabelka: `TitleBlockAttributeParameter` ma nazwę i pozycję, nie treść. Jedyny znacznik podany w pomocy to `SCALE`. Skrypt nie wymyśla znaczników na nazwę pliku, numer arkusza ani datę. Zostawia tabelkę nowego rysunku ISO i, jeśli pola SCALE nie ma, próbuje je dodać. Szkic rysunkowy nie ma tekstu, tylko geometrię.
-- `createDrawing` w trybie ręcznym wymaga szablonu z placeholderami rzutów. Standardowy format A4/A3/A2 ze scratch ich nie ma i zwraca `Manual drawing creation requires a template with view placeholder information`. Skrypt woła tryb ręczny tylko wtedy, gdy w danych Fusion jest szablon `.f2t` tego arkusza i po otwarciu widać na nim rzuty. W przeciwnym razie tworzy arkusz automatycznie w wybranym formacie ISO i sam dokłada rzuty z okna. API nie usuwa rzutów, więc rzuty ze szablonu zostają.
+- Arkusz powstaje tylko w `AutomaticDrawingCreationMode` (`CreateDrawingInput.creationMode`, domyślnie ten tryb). Pomoc nie ma osobnego typu `DrawingCreationOptions`. Tryb z placeholderami nie jest ustawiany. Gdyby `createDrawing` i tak zgłosiło błąd 3, komunikat wypisuje tryb odczytany z wejścia. Potem skrypt dokłada rzuty z okna. API nie usuwa rzutów, więc rzuty z automatycznego arkusza zostają.
 - Ukryte kreski zależą od stylu widoku i od `hiddenLineLineType`. Wyglądu kresek (kreska krótka czy długa) nie sprawdzono na wydruku.
 - `Sheet.width` / `Sheet.height` nie podają jednostki. Skrypt poznaje mm, cm albo cale po porównaniu z wymiarem A4/A3/A2. Punkt rzutu jest w centymetrach, jak w opisie `placementPoint`.
 
