@@ -1,0 +1,1235 @@
+# -*- coding: utf-8 -*-
+"""Rysunek z otwartego modelu — skrypt Fusion (okno polecenia, nie dodatek).
+
+Uruchomienie: Utilities → Scripts and Add-Ins → zakładka Scripts → Run.
+Instrukcja instalacji: fusion/README.md w tym repozytorium.
+
+Źródłem jest aktywny model, także niezapisany. Skrypt nie importuje STEP,
+nie sprawdza projektu w chmurze i nie zapisuje dokumentu.
+Korzysta z podglądowego API rysunków (DrawingManager, Views.add).
+Nie został uruchomiony w Fusion na maszynie, na której powstał.
+"""
+
+import math
+import os
+import threading
+import time
+import traceback
+
+import adsk.core
+import adsk.drawing
+import adsk.fusion
+
+CMD_ID = 'RysunekZeStepCmd'
+EVENT_ID = 'RysunekZeStepJob'
+HANDLERS = []
+
+# Skale z szeregu ISO 5455, od największej. Wybierana jest największa, która
+# mieści rzuty w polu arkusza.
+STANDARD_SCALES = (
+    100.0,
+    50.0,
+    20.0,
+    10.0,
+    5.0,
+    2.0,
+    1.0,
+    1.0 / 2.0,
+    1.0 / 5.0,
+    1.0 / 10.0,
+    1.0 / 20.0,
+    1.0 / 50.0,
+    1.0 / 100.0,
+    1.0 / 200.0,
+    1.0 / 500.0,
+    1.0 / 1000.0,
+    1.0 / 2000.0,
+    1.0 / 5000.0,
+    1.0 / 10000.0,
+)
+
+# Arkusz ISO w orientacji poziomej, milimetry (szerokość × wysokość).
+ISO_LANDSCAPE_MM = {
+    'A4': (297.0, 210.0),
+    'A3': (420.0, 297.0),
+    'A2': (594.0, 420.0),
+}
+
+VIEW_LABELS = {
+    '1 — przód': 1,
+    '2 — przód i góra': 2,
+    '3 — przód, góra i prawy': 3,
+    '4 — te trzy oraz izometria': 4,
+}
+
+DETAIL_LABELS = {
+    'Kontur': 'contour',
+    'Krawędzie widoczne': 'visible',
+    'Widoczne i ukryte': 'hidden',
+}
+
+SHEET_LABELS = {
+    'A4 poziomo': 'A4',
+    'A3 poziomo': 'A3',
+    'A2 poziomo': 'A2',
+}
+
+app = None
+ui = None
+dialog_state = {}
+pending_job = None
+source_document = None
+custom_event = None
+job_started = False
+work_started = False
+script_finished = False
+
+
+def largest_standard_scale(max_scale):
+    """Największa skala ze STANDARD_SCALES nie większa niż max_scale."""
+    for scale in STANDARD_SCALES:
+        if scale <= max_scale + 1e-9:
+            return scale
+    return STANDARD_SCALES[-1]
+
+
+def format_scale(scale):
+    if scale >= 1.0 - 1e-9:
+        whole = int(round(scale))
+        if abs(scale - whole) < 1e-6:
+            return '{}:1'.format(whole)
+        return '{:g}:1'.format(scale)
+    inverse = 1.0 / scale
+    whole = int(round(inverse))
+    if abs(inverse - whole) < 1e-4:
+        return '1:{}'.format(whole)
+    return '1:{:g}'.format(inverse)
+
+
+def view_grid(count):
+    """Układ trzeciego kąta: góra nad przodem, prawy na prawo od przodu, izometria z boku.
+
+    Wiersz 0 jest na dole arkusza. Zwraca (lista (klucz, kolumna, wiersz), kolumny, wiersze).
+    """
+    if count <= 1:
+        return [('front', 0, 0)], 1, 1
+    if count == 2:
+        return [('top', 0, 1), ('front', 0, 0)], 1, 2
+    if count == 3:
+        return [('top', 0, 1), ('front', 0, 0), ('right', 1, 0)], 2, 2
+    return [('top', 0, 1), ('front', 0, 0), ('right', 1, 0), ('iso', 2, 1)], 3, 2
+
+
+def required_model_extent(key, dx, dy, dz):
+    """Bok kwadratu (cm modelu), w którym na pewno mieści się rzut.
+
+    ViewOrientationTypes opisuje przód jako patrzenie wzdłuż ujemnej osi Z,
+    więc przód pokazuje X i Y, ale nie mówi, która oś jest pozioma na arkuszu.
+    Dla góry i prawego rzutu dokumentacja nie podaje osi. Dlatego każdy rzut
+    prostokątny rezerwuje największy z wymiarów w obu kierunkach, a izometria
+    rezerwuje przekątną przestrzenną (każdy rzut prostopadłościanu się w niej mieści).
+    """
+    largest = max(dx, dy, dz, 0.0)
+    if key == 'front':
+        return max(dx, dy, 0.0)
+    if key == 'iso':
+        return math.hypot(dx, dy, dz)
+    return largest
+
+
+def sheet_size_cm(width, height, sheet_key):
+    """Szerokość i wysokość arkusza w centymetrach oraz skąd wzięto jednostki.
+
+    BaseViewInput.placementPoint jest w centymetrach. Sheet.width nie podaje
+    jednostki; CustomSheetSize mówi o jednostkach dokumentu (dla ISO: mm).
+    """
+    expect_w, expect_h = ISO_LANDSCAPE_MM[sheet_key]
+
+    def close(value, expected):
+        return abs(value - expected) <= max(1.0, abs(expected) * 0.08)
+
+    if close(width, expect_w) and close(height, expect_h):
+        return width / 10.0, height / 10.0, 'mm'
+    if close(width, expect_w / 10.0) and close(height, expect_h / 10.0):
+        return width, height, 'cm'
+    if close(width, expect_w / 25.4) and close(height, expect_h / 25.4):
+        return width * 2.54, height * 2.54, 'in'
+    if width > 100.0:
+        return width / 10.0, height / 10.0, 'mm?'
+    return width, height, '?'
+
+
+def margins_cm(sheet_w, sheet_h):
+    """Marginesy w cm. Dolny jest wyższy, żeby zejść z typowej tabelki rysunkowej."""
+    left = right = top = 1.5
+    bottom = 5.0
+    if sheet_w < left + right + 8.0:
+        left = right = 0.8
+    if sheet_h < top + bottom + 8.0:
+        top = 0.8
+        bottom = max(2.0, sheet_h * 0.22)
+    return left, right, top, bottom
+
+
+def place_views(sheet_w, sheet_h, count, extents):
+    """Zwraca (skala, lista {key, x, y}, czy skala mieści się w limicie).
+
+    x, y to środek rzutu w cm, początek w lewym dolnym rogu arkusza.
+    """
+    specs, cols, rows = view_grid(count)
+    left, right, top, bottom = margins_cm(sheet_w, sheet_h)
+    usable_w = sheet_w - left - right
+    usable_h = sheet_h - top - bottom
+    if usable_w <= 1.0 or usable_h <= 1.0:
+        raise ValueError('Arkusz jest za mały, żeby rozmieścić rzuty z marginesem.')
+
+    cell_w = usable_w / float(cols)
+    cell_h = usable_h / float(rows)
+    pad = min(0.8, cell_w * 0.15, cell_h * 0.15)
+    avail_w = cell_w - pad
+    avail_h = cell_h - pad
+    if avail_w <= 0.4 or avail_h <= 0.4:
+        raise ValueError('Za mało miejsca między rzutami.')
+
+    limits = []
+    for key, _col, _row in specs:
+        extent = extents[key]
+        if extent > 1e-6:
+            limits.append(min(avail_w / extent, avail_h / extent))
+    if not limits:
+        raise ValueError('Model nie ma wymiaru, z którego da się zrobić rzut.')
+
+    limit = min(limits)
+    scale = largest_standard_scale(limit)
+    fits = scale <= limit + 1e-9
+
+    placed = []
+    for key, col, row in specs:
+        placed.append({
+            'key': key,
+            'x': left + (col + 0.5) * cell_w,
+            'y': bottom + (row + 0.5) * cell_h,
+        })
+    return scale, placed, fits
+
+
+class PdfCancelled(Exception):
+    pass
+
+
+def _message(text):
+    if ui:
+        ui.messageBox(text, 'Rysunek z modelu')
+
+
+def _finish():
+    global custom_event, script_finished
+    if script_finished:
+        return
+    script_finished = True
+    try:
+        if app:
+            app.unregisterCustomEvent(EVENT_ID)
+    except Exception:
+        pass
+    custom_event = None
+    try:
+        if ui:
+            command_def = ui.commandDefinitions.itemById(CMD_ID)
+            if command_def:
+                command_def.deleteMe()
+    except Exception:
+        pass
+    adsk.terminate()
+
+
+def _defer_fire():
+    """Wołane z wątku roboczego. Jedyna dozwolona funkcja Fusion to fireCustomEvent."""
+    time.sleep(0.4)
+    for _ in range(40):
+        try:
+            if app and app.fireCustomEvent(EVENT_ID, 'go'):
+                return
+        except Exception:
+            pass
+        time.sleep(0.25)
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(
+            0,
+            'Nie udało się wznowić skryptu po zamknięciu okna. '
+            'Zostaw Fusion otwarty i uruchom skrypt jeszcze raz.',
+            'Rysunek z modelu',
+            0,
+        )
+    except Exception:
+        pass
+
+
+def _start_work():
+    global work_started
+    if work_started or not pending_job:
+        return
+    work_started = True
+    try:
+        build_drawing(pending_job)
+    except PdfCancelled:
+        _message('Nie zapisano PDF.')
+    except Exception:
+        _message('Nie udało się utworzyć rysunku:\n{}'.format(traceback.format_exc()))
+    _finish()
+
+
+def _register_job_event():
+    global custom_event
+    try:
+        app.unregisterCustomEvent(EVENT_ID)
+    except Exception:
+        pass
+    custom_event = app.registerCustomEvent(EVENT_ID)
+    if not custom_event:
+        raise RuntimeError('Fusion nie zarejestrował zdarzenia skryptu.')
+    on_job = JobHandler()
+    custom_event.add(on_job)
+    HANDLERS.append(on_job)
+    HANDLERS.append(custom_event)
+
+
+def _read_options():
+    view_item = dialog_state['views'].selectedItem
+    detail_item = dialog_state['detail'].selectedItem
+    sheet_item = dialog_state['sheet'].selectedItem
+    if not view_item or not detail_item or not sheet_item:
+        raise ValueError('Wybierz liczbę rzutów, szczegółowość i arkusz.')
+    if view_item.name not in VIEW_LABELS:
+        raise ValueError('Nieznana liczba rzutów.')
+    if detail_item.name not in DETAIL_LABELS:
+        raise ValueError('Nieznana szczegółowość.')
+    if sheet_item.name not in SHEET_LABELS:
+        raise ValueError('Nieznany arkusz.')
+
+    return {
+        'views': VIEW_LABELS[view_item.name],
+        'detail': DETAIL_LABELS[detail_item.name],
+        'sheet': SHEET_LABELS[sheet_item.name],
+    }
+
+
+def _design_from_document(document):
+    if not document:
+        return None
+    try:
+        product = document.products.itemByProductType('DesignProductType')
+    except Exception:
+        return None
+    return adsk.fusion.Design.cast(product)
+
+
+def _active_design():
+    document = app.activeDocument if app else None
+    design = _design_from_document(document)
+    if design:
+        return document, design
+    design = _design_from_document(source_document)
+    if design:
+        return source_document, design
+    return None, None
+
+
+def _appearance(detail):
+    visible = adsk.drawing.DrawingViewStyleTypes.VisibleEdgesDrawingViewStyleType
+    hidden = adsk.drawing.DrawingViewStyleTypes.VisibleAndHiddenEdgesDrawingViewStyleType
+    tangent_off = adsk.drawing.TangentEdgeDisplayTypes.OffTangentEdgeDisplayType
+    tangent_on = adsk.drawing.TangentEdgeDisplayTypes.FullLengthTangentEdgeDisplayType
+    if detail == 'contour':
+        return visible, tangent_off
+    if detail == 'visible':
+        return visible, tangent_on
+    return hidden, tangent_on
+
+
+def _orientation(key):
+    orientations = adsk.drawing.ViewOrientationTypes
+    return {
+        'front': orientations.FrontViewOrientationType,
+        'top': orientations.TopViewOrientationType,
+        'right': orientations.RightViewOrientationType,
+        'iso': orientations.IsoTopRightViewOrientationType,
+    }[key]
+
+
+def _drawing_source(document):
+    """Źródło rysunku to otwarty dokument. Zapis i projekt w chmurze nie są wymagane."""
+    try:
+        data_file = document.dataFile
+    except Exception:
+        data_file = None
+    return data_file if data_file else document
+
+
+def _model_extents(design):
+    box = design.rootComponent.boundingBox
+    dx = abs(box.maxPoint.x - box.minPoint.x)
+    dy = abs(box.maxPoint.y - box.minPoint.y)
+    dz = abs(box.maxPoint.z - box.minPoint.z)
+    if not all(math.isfinite(value) for value in (dx, dy, dz)):
+        raise RuntimeError('Nie da się odczytać gabarytu modelu.')
+    if max(dx, dy, dz) <= 1e-6:
+        raise RuntimeError('Otwarty model nie ma geometrii do narysowania.')
+    return dx, dy, dz
+
+
+def _apply_sheet(sheet, sheet_key):
+    sizes = {
+        'A4': adsk.drawing.SheetSizes.A4ISOSheetSize,
+        'A3': adsk.drawing.SheetSizes.A3ISOSheetSize,
+        'A2': adsk.drawing.SheetSizes.A2ISOSheetSize,
+    }
+    sheet.sheetSize = sizes[sheet_key]
+    sheet.orientation = adsk.drawing.SheetOrientationTypes.LandscapeSheetOrientationType
+
+
+def _ensure_title_block(drawing, sheet, sheet_w, scale_text):
+    """Zostawia tabelkę Fusion. API nie ma pola na dowolny tekst (nazwa, data).
+
+    Jedyny udokumentowany znacznik to SCALE. Jeśli tabelka go nie ma, skrypt
+    próbuje go dodać. Niepowodzenie nie przerywa eksportu.
+    """
+    note = (
+        'Tabelka: API nie pozwala wpisać nazwy pliku, arkusza ani daty. '
+        'Zostaje tabelka, którą Fusion wstawia do nowego rysunku ISO.'
+    )
+    try:
+        block = sheet.titleBlock
+    except Exception:
+        block = None
+    if not block:
+        try:
+            blocks = drawing.titleBlocks
+            if blocks and blocks.count:
+                block = blocks.item(0)
+                sheet.titleBlock = block
+                note = (
+                    'Tabelka: przypisano istniejącą definicję z rysunku. '
+                    'API nie pozwala wpisać nazwy pliku, arkusza ani daty.'
+                )
+        except Exception:
+            block = None
+    if not block:
+        return 'Tabelka: rysunek nie zwrócił żadnej tabelki. PDF będzie bez niej.'
+
+    names = []
+    try:
+        existing = block.getAttributes()
+        if existing:
+            for attr in existing:
+                names.append((attr.attributeName or '').upper())
+    except Exception:
+        existing = None
+
+    if 'SCALE' in names:
+        return note + ' Pole SCALE już jest w tabelce.'
+
+    try:
+        parameter = block.createAttributeParameter()
+        parameter.attributeName = 'SCALE'
+        parameter.position = adsk.core.Point2D.create(max(0.5, sheet_w - 4.0), 1.2)
+        if block.setAttributes([parameter]):
+            return note + ' Dodano pole SCALE (skala {}).'.format(scale_text)
+    except Exception:
+        pass
+    return note + ' Nie udało się dodać pola SCALE.'
+
+
+def _set_param(obj, name, value):
+    try:
+        setattr(obj, name, value)
+        return True
+    except Exception:
+        return False
+
+
+def _view_curve_count(view):
+    """viewCurves nie uruchamia VIEWEDIT. Pusty zbiór znaczy, że rzut nie ma krawędzi modelu."""
+    try:
+        curves = view.viewCurves
+        return int(curves.count or 0)
+    except Exception:
+        return 0
+
+
+def _wait_for_curves(view):
+    for _ in range(40):
+        if _view_curve_count(view) > 0:
+            return True
+        try:
+            adsk.doEvents()
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return _view_curve_count(view) > 0
+
+
+def _geometry_view_count(sheet):
+    try:
+        count = int(sheet.views.count or 0)
+    except Exception:
+        return 0
+    found = 0
+    for index in range(count):
+        try:
+            view = sheet.views.item(index)
+        except Exception:
+            continue
+        if _view_curve_count(view) > 0:
+            found += 1
+    return found
+
+
+def _add_base_view(views, key, scale, style, tangent, x_cm, y_cm):
+    """Styl, skala i styczne idą tylko na wejście. Gotowego rzutu nie czytamy: get_style zdejmuje rzut."""
+    view_input = views.createBaseViewInput()
+    view_input.placementPoint = adsk.drawing.DrawingPoint.create(
+        adsk.core.Point2D.create(x_cm, y_cm)
+    )
+    parameters = view_input.viewParameters
+    if not _set_param(parameters, 'orientation', _orientation(key)):
+        raise RuntimeError('Fusion nie przyjął orientacji rzutu {}.'.format(key))
+    _set_param(parameters, 'scaleValue', scale)
+    _set_param(parameters, 'style', style)
+    _set_param(parameters, 'tangentEdgesType', tangent)
+    view = views.add(view_input)
+    if not view:
+        raise RuntimeError('Fusion nie dodał rzutu ({}).'.format(key))
+    if not _wait_for_curves(view):
+        raise RuntimeError(
+            'Rzut {} nie ma krawędzi modelu. PDF nie zostanie zapisany.'.format(key)
+        )
+    return view
+
+
+def _point_xy(point):
+    coord = point
+    try:
+        coord = point.coordinate
+    except Exception:
+        pass
+    return float(coord.x), float(coord.y)
+
+
+def _curve_points(view):
+    found = []
+    try:
+        curves = view.viewCurves
+        count = int(curves.count or 0)
+    except Exception:
+        return found
+    for index in range(count):
+        try:
+            curve = curves.item(index)
+        except Exception:
+            continue
+        for name in ('startPoint', 'endPoint', 'midPoint', 'centerPoint'):
+            try:
+                point = getattr(curve, name)
+            except Exception:
+                point = None
+            if not point:
+                continue
+            try:
+                x_cm, y_cm = _point_xy(point)
+            except Exception:
+                continue
+            if math.isfinite(x_cm) and math.isfinite(y_cm):
+                found.append((x_cm, y_cm, point))
+    return found
+
+
+def _extreme_points(points):
+    """Lewy, prawy, dolny i górny punkt z listy (x, y, punkt)."""
+    if len(points) < 2:
+        return None
+    left = min(points, key=lambda item: (item[0], item[1]))
+    right = max(points, key=lambda item: (item[0], -item[1]))
+    bottom = min(points, key=lambda item: (item[1], item[0]))
+    top = max(points, key=lambda item: (item[1], -item[0]))
+    return left, right, bottom, top
+
+
+def _dimension_count(sheet):
+    try:
+        return int(sheet.drawingDimensions.count or 0)
+    except Exception:
+        return 0
+
+
+def _auto_overall(sheet, view):
+    dim_input = sheet.createAutoDimensionInput()
+    dim_input.view = view
+    dim_input.dimensionStrategy = (
+        adsk.drawing.DimensionStrategyTypes.OverallDimensionStrategyType
+    )
+    return bool(sheet.autoDimension(dim_input))
+
+
+def _drawing_point(x_cm, y_cm):
+    return adsk.drawing.DrawingPoint.create(adsk.core.Point2D.create(x_cm, y_cm))
+
+
+def _linear_overall(sheet, view):
+    extremes = _extreme_points(_curve_points(view))
+    if not extremes:
+        return False
+    left, right, bottom, top = extremes
+    dimensions = sheet.drawingDimensions
+    made = False
+    if abs(right[0] - left[0]) > 1e-4:
+        place_y = min(left[1], right[1]) - 0.8
+        dimension = dimensions.addLinearDimension(
+            left[2],
+            right[2],
+            _drawing_point((left[0] + right[0]) / 2.0, place_y),
+            False,
+        )
+        made = made or bool(dimension)
+    if abs(top[1] - bottom[1]) > 1e-4:
+        place_x = min(bottom[0], top[0]) - 0.8
+        dimension = dimensions.addLinearDimension(
+            bottom[2],
+            top[2],
+            _drawing_point(place_x, (bottom[1] + top[1]) / 2.0),
+            False,
+        )
+        made = made or bool(dimension)
+    return made
+
+
+def _dimension_orthographic(sheet, view):
+    before = _dimension_count(sheet)
+    try:
+        if _auto_overall(sheet, view) and _dimension_count(sheet) > before:
+            return 'gabaryt automatyczny'
+    except Exception:
+        pass
+    try:
+        if _linear_overall(sheet, view):
+            return 'gabaryt z krawędzi rzutu'
+    except Exception:
+        return None
+    return None
+
+
+def _wait_for_drawing_idle():
+    """createDrawing wraca, zanim „Automatyzacja rysunku” skończy podmieniać arkusz."""
+    started = time.time()
+    deadline = started + 45.0
+    saw_busy = False
+    while time.time() < deadline:
+        command = ''
+        try:
+            command = ui.activeCommand or ''
+        except Exception:
+            return
+        busy = command not in ('', 'SelectCommand')
+        if busy:
+            saw_busy = True
+        elif saw_busy or time.time() > started + 2.0:
+            return
+        try:
+            adsk.doEvents()
+        except Exception:
+            return
+        time.sleep(0.25)
+
+
+def _active_drawing(fallback):
+    try:
+        drawing_document = adsk.drawing.DrawingDocument.cast(app.activeDocument)
+        if drawing_document and drawing_document.drawing:
+            return drawing_document.drawing
+    except Exception:
+        pass
+    return fallback
+
+
+def _pdf_stem(document):
+    raw = ''
+    try:
+        raw = document.name or ''
+    except Exception:
+        raw = ''
+    cleaned = []
+    for char in raw:
+        if char in '<>:"/\\|?*' or ord(char) < 32:
+            cleaned.append('_')
+        else:
+            cleaned.append(char)
+    name = ''.join(cleaned).strip(' ._')
+    return name or 'rysunek'
+
+
+def _document_pdf_path(document):
+    """Lokalna ścieżka obok dokumentu, jeśli Fusion ją w ogóle ma. Niezapisany model jej nie ma."""
+    for attr in ('path', 'pathName', 'fullPath'):
+        try:
+            value = getattr(document, attr)
+        except Exception:
+            continue
+        if isinstance(value, str) and value and os.path.isabs(value):
+            folder = value if os.path.isdir(value) else os.path.dirname(value)
+            if folder and os.path.isdir(folder):
+                return os.path.join(folder, _pdf_stem(document) + '.pdf')
+    return None
+
+
+def _ask_pdf_path(document):
+    dialog = ui.createFileDialog()
+    dialog.title = 'Zapisz PDF'
+    dialog.filter = 'PDF (*.pdf)'
+    dialog.filterIndex = 0
+    dialog.initialFilename = _pdf_stem(document) + '.pdf'
+    if dialog.showSave() != adsk.core.DialogResults.DialogOK:
+        raise PdfCancelled()
+    chosen = dialog.filename
+    if not chosen.lower().endswith('.pdf'):
+        chosen += '.pdf'
+    return chosen
+
+
+def _export_pdf(drawing, document):
+    target = _document_pdf_path(document)
+    if target and _write_pdf(drawing, target):
+        return target
+    chosen = _ask_pdf_path(document)
+    if not _write_pdf(drawing, chosen):
+        raise RuntimeError('Eksport PDF nie powiódł się:\n{}'.format(chosen))
+    return chosen
+
+
+def _write_pdf(drawing, path):
+    export_manager = drawing.exportManager
+    options = export_manager.createPDFExportOptions(path)
+    options.sheetsToExport = adsk.drawing.PDFSheetsExport.AllPDFSheetsExport
+    options.useLineWeights = True
+    options.openPDF = False
+    return bool(export_manager.execute(options))
+
+
+last_drawing_note = ''
+
+
+def _sheet_sizes():
+    return {
+        'A4': adsk.drawing.SheetSizes.A4ISOSheetSize,
+        'A3': adsk.drawing.SheetSizes.A3ISOSheetSize,
+        'A2': adsk.drawing.SheetSizes.A2ISOSheetSize,
+    }
+
+
+def _automatic_mode():
+    return adsk.drawing.DrawingCreationModes.AutomaticDrawingCreationMode
+
+
+def _mode_label(drawing_input):
+    automatic = _automatic_mode()
+    try:
+        mode = drawing_input.creationMode
+    except Exception as error:
+        return 'nie odczytano ({})'.format(error)
+    if mode == automatic:
+        return 'AutomaticDrawingCreationMode'
+    try:
+        shown = int(mode)
+    except Exception:
+        shown = mode
+    return 'nie AutomaticDrawingCreationMode ({})'.format(shown)
+
+
+def _apply_sheet_settings(drawing_input, sheet_key):
+    drawing_input.standard = adsk.drawing.DrawingStandardTypes.ISODrawingStandardType
+    drawing_input.units = adsk.drawing.DrawingUnitTypes.MillimeterDrawingUnitType
+    drawing_input.sheetSize = _sheet_sizes()[sheet_key]
+    drawing_input.orientationType = adsk.drawing.SheetOrientationTypes.LandscapeSheetOrientationType
+    try:
+        drawing_input.configuration = ''
+    except Exception:
+        pass
+
+
+def _configure_standard_sheet(drawing_input):
+    """Jeden arkusz ISO wybranego formatu, bez dodatkowych arkuszy i bez autowymiarów."""
+    try:
+        preferences = drawing_input.automationPreferences
+        global_preferences = preferences.globalPreferences
+        global_preferences.isMainAssemblySheetGenerated = True
+        global_preferences.isSubAssemblySheetGenerated = False
+        global_preferences.isAnimationSheetGenerated = False
+        global_preferences.isComponentSheetGenerated = False
+        global_preferences.isFoldedModelSheetGenerated = False
+        global_preferences.isFlatPatternSheetGenerated = False
+        global_preferences.isAutoDimensionEnabled = False
+    except Exception:
+        return
+    try:
+        main_sheet = preferences.mainAssemblyPreferences
+        main_sheet.orthogonalViewSheetPreferences.isSheetCreated = True
+        main_sheet.orthogonalViewSheetPreferences.isPartsListIncluded = False
+        main_sheet.isoViewSheetPreferences.isSheetCreated = False
+        main_sheet.isoViewSheetPreferences.isPartsListIncluded = False
+        main_sheet.autoDimensionPreferences.isAutoDimensionEnabled = False
+    except Exception:
+        pass
+
+
+def _prepare_drawing_input(manager, document, sheet_key):
+    """CreateDrawingInput w trybie automatycznym. Pomoc nie ma osobnego DrawingCreationOptions.
+
+    Tryb jest argumentem createDrawingInput i właściwością creationMode.
+    Domyślna wartość tej właściwości to AutomaticDrawingCreationMode.
+    Szablon i tryb z placeholderami nie są ustawiane.
+    """
+    automatic = _automatic_mode()
+    drawing_input = manager.createDrawingInput(_drawing_source(document), automatic)
+    if not drawing_input:
+        raise RuntimeError(
+            'Fusion nie przygotował rysunku z otwartego modelu. '
+            'Skrypt nie zapisywał dokumentu i nie wybierał projektu.'
+        )
+    _apply_sheet_settings(drawing_input, sheet_key)
+    drawing_input.baseDocumentType = adsk.drawing.BaseDocumentTypes.FromScratchBaseDocumentType
+    drawing_input.creationMode = automatic
+    try:
+        drawing_input.sheetCreationType = (
+            adsk.drawing.SheetCreationTypes.FirstLevelOnlySheetCreationType
+        )
+    except Exception:
+        pass
+    try:
+        drawing_input.content = adsk.drawing.DrawingContentTypes.FullAssemblyDrawingContentType
+    except Exception:
+        pass
+    _configure_standard_sheet(drawing_input)
+    drawing_input.creationMode = automatic
+    label = _mode_label(drawing_input)
+    if drawing_input.creationMode != automatic:
+        raise RuntimeError(
+            'Fusion nie przyjął trybu automatycznego, więc createDrawing nie zostało wywołane.\n'
+            'Tryb tworzenia: {}.'.format(label)
+        )
+    return drawing_input, label
+
+
+def _open_drawing_file(drawing_file):
+    opened = app.documents.open(drawing_file, True)
+    drawing_document = adsk.drawing.DrawingDocument.cast(opened)
+    if not drawing_document:
+        drawing_document = adsk.drawing.DrawingDocument.cast(app.activeDocument)
+    if not drawing_document:
+        raise RuntimeError('Nie udało się otworzyć utworzonego rysunku.')
+    return drawing_document.drawing
+
+
+def _create_drawing(document, sheet_key):
+    global last_drawing_note
+    manager = adsk.drawing.DrawingManager.get()
+    if not manager:
+        raise RuntimeError('Fusion nie zwrócił DrawingManager.')
+
+    try:
+        document.activate()
+    except Exception:
+        pass
+
+    drawing_input, mode_label = _prepare_drawing_input(manager, document, sheet_key)
+    try:
+        drawing_file = manager.createDrawing(drawing_input)
+    except Exception as error:
+        raise RuntimeError(
+            'Nie udało się utworzyć rysunku z otwartego modelu.\n'
+            'Tryb tworzenia: {}.\n'
+            'Skrypt nie zapisywał dokumentu i nie wybierał projektu.\n{}'.format(mode_label, error)
+        )
+    if not drawing_file:
+        raise RuntimeError(
+            'Tworzenie rysunku z otwartego modelu nie zwróciło pliku.\n'
+            'Tryb tworzenia: {}.\n'
+            'Skrypt nie zapisywał dokumentu i nie wybierał projektu.'.format(mode_label)
+        )
+    last_drawing_note = 'Arkusz {} ISO poziomo. Tryb tworzenia: {}.'.format(sheet_key, mode_label)
+    return _open_drawing_file(drawing_file)
+
+
+def _projection_note(drawing):
+    try:
+        angle = drawing.documentSettings.projectionAngle
+    except Exception:
+        return 'Kąt rzutowania dokumentu: nie odczytano (właściwość jest tylko do odczytu).'
+    third = adsk.drawing.ProjectionAngleTypes.ThirdAngleProjectionAngleType
+    first = adsk.drawing.ProjectionAngleTypes.FirstAngleProjectionAngleType
+    if angle == third:
+        flag = 'trzeci kąt'
+    elif angle == first:
+        flag = 'pierwszy kąt (tak opisuje norma ISO w tym API)'
+    else:
+        flag = 'nieznany'
+    return (
+        'Flaga dokumentu: {}. Rzuty są osobnymi widokami bazowymi ustawionymi '
+        'jak w trzecim kącie (góra nad przodem, prawy na prawo od przodu). '
+        'API nie tworzy rzutu pochodnego i nie pozwala zmienić kąta dokumentu.'
+    ).format(flag)
+
+
+def build_drawing(options):
+    if ui.activeCommand != 'SelectCommand':
+        select_command = ui.commandDefinitions.itemById('SelectCommand')
+        if select_command:
+            select_command.execute()
+            adsk.doEvents()
+
+    document, design = _active_design()
+    if not design:
+        _message('Nie ma otwartego modelu. Otwórz model w Fusion i uruchom skrypt ponownie.')
+        return
+
+    try:
+        document.activate()
+    except Exception:
+        pass
+
+    _message(
+        'Tworzę rysunek z otwartego modelu.\n'
+        'Dokument nie jest zapisywany. Po kliknięciu OK poczekaj na okno zapisu PDF.'
+    )
+
+    dx, dy, dz = _model_extents(design)
+    drawing = _create_drawing(document, options['sheet'])
+    _wait_for_drawing_idle()
+    drawing = _active_drawing(drawing)
+    try:
+        drawing.parentDocument.activate()
+    except Exception:
+        pass
+    try:
+        drawing.parentDocument.updateAllReferences()
+    except Exception:
+        pass
+    try:
+        adsk.doEvents()
+    except Exception:
+        pass
+
+    sheet = drawing.activeSheet
+    if not sheet:
+        raise RuntimeError('Nowy rysunek nie ma arkusza.')
+
+    sheet_error = None
+    try:
+        _apply_sheet(sheet, options['sheet'])
+    except Exception as error:
+        sheet_error = error
+
+    sheet_w, sheet_h, unit_guess = sheet_size_cm(sheet.width, sheet.height, options['sheet'])
+    count = int(options['views'])
+    extents = {}
+    for key, _col, _row in view_grid(count)[0]:
+        extents[key] = required_model_extent(key, dx, dy, dz)
+    scale, placed, fits = place_views(sheet_w, sheet_h, count, extents)
+    style, tangent = _appearance(options['detail'])
+
+    warnings = []
+    if sheet_error:
+        warnings.append(
+            'Nie ustawiono arkusza {} poziomo ({}). Zostaje odczytany format: {}.'.format(
+                options['sheet'], sheet_error, unit_guess
+            )
+        )
+    elif unit_guess not in ('mm', 'cm', 'in'):
+        warnings.append(
+            'Szerokość arkusza nie zgadza się z {} poziomo (odczyt: {}).'.format(
+                options['sheet'], unit_guess
+            )
+        )
+    if options['detail'] == 'hidden':
+        try:
+            drawing.documentSettings.viewSettings.hiddenLineLineType = (
+                adsk.drawing.LineTypes.HiddenLineType
+            )
+        except Exception:
+            warnings.append(
+                'Nie ustawiono typu linii HIDDEN. Styl rzutu i tak prosi o krawędzie ukryte.'
+            )
+
+    try:
+        existing = int(sheet.views.count or 0)
+    except Exception:
+        existing = 0
+    if existing:
+        warnings.append(
+            'Arkusz miał już {} rzutów. API widoku nie ma usuwania, '
+            'więc doszły rzuty wybrane w oknie.'.format(existing)
+        )
+
+    created = []
+    for item in placed:
+        view = _add_base_view(
+            sheet.views,
+            item['key'],
+            scale,
+            style,
+            tangent,
+            item['x'],
+            item['y'],
+        )
+        created.append((item['key'], view))
+
+    if _geometry_view_count(sheet) < count:
+        raise RuntimeError(
+            'Na arkuszu jest {} rzutów z krawędziami modelu, a okno prosiło o {}. '
+            'PDF nie został zapisany.'.format(_geometry_view_count(sheet), count)
+        )
+
+    for key, view in created:
+        if key == 'iso':
+            continue
+        note = _dimension_orthographic(sheet, view)
+        if note:
+            warnings.append('Rzut {}: {}.'.format(key, note))
+        else:
+            warnings.append('Rzut {}: nie udało się dodać wymiarów gabarytowych.'.format(key))
+
+    if _geometry_view_count(sheet) < count:
+        raise RuntimeError(
+            'Rzuty zniknęły przed zapisem PDF. Plik nie został zapisany.'
+        )
+
+    scale_text = format_scale(scale)
+    title_note = _ensure_title_block(drawing, sheet, sheet_w, scale_text)
+    try:
+        drawing.parentDocument.activate()
+    except Exception:
+        pass
+    try:
+        adsk.doEvents()
+    except Exception:
+        pass
+    pdf_path = _export_pdf(drawing, document)
+
+    lines = [
+        'Zapisano PDF:',
+        pdf_path,
+        '',
+        'Arkusz: {} poziomo. Skala: {}.'.format(options['sheet'], scale_text),
+        last_drawing_note,
+        _projection_note(drawing),
+        title_note,
+        'Jednostka odczytana z szerokości arkusza: {}.'.format(unit_guess),
+    ]
+    if not fits:
+        lines.append(
+            'Nawet najmniejsza skala z szeregu (1:10000) może nie zmieścić modelu w marginesie.'
+        )
+    lines.extend(warnings)
+    _message('\n'.join(lines))
+
+
+class CreatedHandler(adsk.core.CommandCreatedEventHandler):
+    def __init__(self):
+        super().__init__()
+
+    def notify(self, args):
+        try:
+            command = adsk.core.CommandCreatedEventArgs.cast(args).command
+            command.setDialogInitialSize(480, 280)
+            inputs = command.commandInputs
+
+            inputs.addTextBoxCommandInput(
+                'wstep',
+                '',
+                'Rysunek z otwartego modelu, także niezapisany. '
+                'Bez importu STEP, bez zapisu do chmury, bez przekrojów, '
+                'tolerancji geometrycznych i listy części.',
+                3,
+                True,
+            )
+
+            views = inputs.addDropDownCommandInput(
+                'liczbaRzutow',
+                'Liczba rzutów',
+                adsk.core.DropDownStyles.TextListDropDownStyle,
+            )
+            views.tooltipDescription = (
+                '1 przód. 2 przód i góra nad nim. 3 dodatkowo prawy na prawo od przodu. '
+                '4 dodatkowo izometria z boku. Układ jak w trzecim kącie.'
+            )
+            for index, label in enumerate(VIEW_LABELS):
+                views.listItems.add(label, index == 2, '')
+            dialog_state['views'] = views
+
+            detail = inputs.addDropDownCommandInput(
+                'szczegolowosc',
+                'Szczegółowość',
+                adsk.core.DropDownStyles.TextListDropDownStyle,
+            )
+            detail.tooltipDescription = (
+                'Kontur: tylko widoczne krawędzie ostre. '
+                'Krawędzie widoczne: ostre i styczne, bez ukrytych. '
+                'Widoczne i ukryte: to samo oraz krawędzie ukryte (typ linii HIDDEN).'
+            )
+            for index, label in enumerate(DETAIL_LABELS):
+                detail.listItems.add(label, index == 0, '')
+            dialog_state['detail'] = detail
+
+            sheet = inputs.addDropDownCommandInput(
+                'arkusz',
+                'Arkusz',
+                adsk.core.DropDownStyles.TextListDropDownStyle,
+            )
+            sheet.tooltipDescription = 'Wszystkie arkusze są poziome (A4, A3 albo A2).'
+            for index, label in enumerate(SHEET_LABELS):
+                sheet.listItems.add(label, index == 1, '')
+            dialog_state['sheet'] = sheet
+
+            on_execute = ExecuteHandler()
+            command.execute.add(on_execute)
+            HANDLERS.append(on_execute)
+
+            on_destroy = DestroyHandler()
+            command.destroy.add(on_destroy)
+            HANDLERS.append(on_destroy)
+            dialog_state['ready'] = True
+        except Exception:
+            _message('Nie udało się zbudować okna:\n{}'.format(traceback.format_exc()))
+
+
+class ExecuteHandler(adsk.core.CommandEventHandler):
+    def __init__(self):
+        super().__init__()
+
+    def notify(self, args):
+        global pending_job
+        event_args = adsk.core.CommandEventArgs.cast(args)
+        try:
+            pending_job = _read_options()
+        except ValueError as error:
+            pending_job = None
+            event_args.executeFailed = True
+            event_args.executeFailedMessage = str(error)
+        except Exception:
+            pending_job = None
+            event_args.executeFailed = True
+            event_args.executeFailedMessage = traceback.format_exc()
+
+
+def _reason_value(reason):
+    names = (
+        'UnknownTerminationReason',
+        'CompletedTerminationReason',
+        'CancelledTerminationReason',
+        'AbortedTerminationReason',
+        'PreEmptedTerminationReason',
+        'SessionEndingTerminationReason',
+    )
+    for value, name in enumerate(names):
+        expected = getattr(adsk.core.CommandTerminationReason, name, None)
+        if expected is not None and reason == expected:
+            return value
+    try:
+        number = int(reason)
+    except Exception:
+        return -1
+    if 0 <= number <= 5:
+        return number
+    return -1
+
+
+class DestroyHandler(adsk.core.CommandEventHandler):
+    def __init__(self):
+        super().__init__()
+
+    def notify(self, args):
+        global job_started
+        try:
+            reason = _reason_value(adsk.core.CommandEventArgs.cast(args).terminationReason)
+        except Exception:
+            return
+        # 1 = OK i wykonanie się udało. 2 = Anuluj.
+        # Inny powód (także błąd OK) zostawia okno w spokoju: bez komunikatu i bez terminate.
+        if reason == 1 and pending_job and not job_started:
+            job_started = True
+            threading.Thread(target=_defer_fire, daemon=True).start()
+            return
+        if reason == 2:
+            _finish()
+
+
+class JobHandler(adsk.core.CustomEventHandler):
+    def __init__(self):
+        super().__init__()
+
+    def notify(self, args):
+        _start_work()
+
+
+def run(_context):
+    global app, ui, pending_job, source_document, job_started, work_started, script_finished
+    app = adsk.core.Application.get()
+    ui = app.userInterface if app else None
+    pending_job = None
+    source_document = None
+    job_started = False
+    work_started = False
+    script_finished = False
+    dialog_state.clear()
+    try:
+        if not app or not ui:
+            return
+        document, design = _active_design()
+        if not design:
+            _message('Nie ma otwartego modelu. Otwórz model w Fusion i uruchom skrypt ponownie.')
+            return
+        source_document = document
+        # Skrypt ma zostać w pamięci po powrocie z run(). Okno polecenia
+        # żyje tylko wtedy, gdy run() odda wątek Fusionowi. Pętla doEvents
+        # w run() zamyka to okno od razu.
+        adsk.autoTerminate(False)
+
+        existing = ui.commandDefinitions.itemById(CMD_ID)
+        if existing:
+            existing.deleteMe()
+
+        _register_job_event()
+
+        command_def = ui.commandDefinitions.addButtonDefinition(
+            CMD_ID,
+            'Rysunek z modelu',
+            'Tworzy rysunek PDF z otwartego modelu, bez importu i bez zapisu.',
+        )
+        HANDLERS.append(command_def)
+        on_created = CreatedHandler()
+        command_def.commandCreated.add(on_created)
+        HANDLERS.append(on_created)
+        command_def.execute()
+
+        # execute() zwykle wraca od razu i okno zostaje. Jeśli w tej wersji
+        # Fusion czeka w execute() aż do OK, dialog jest już zamknięty i
+        # pracę trzeba dokończyć tutaj, zanim run() się skończy.
+        if job_started:
+            deadline = time.time() + 8.0
+            while not work_started and time.time() < deadline:
+                adsk.doEvents()
+                time.sleep(0.05)
+            if not work_started:
+                _start_work()
+    except Exception:
+        _message('Nie udało się uruchomić skryptu:\n{}'.format(traceback.format_exc()))
+        _finish()
+
+
+def stop(_context):
+    global custom_event
+    try:
+        if app:
+            app.unregisterCustomEvent(EVENT_ID)
+    except Exception:
+        pass
+    custom_event = None

@@ -1,0 +1,15 @@
+{
+	"autodeskProduct": "Fusion",
+	"type": "script",
+	"id": "",
+	"author": "",
+	"description": {
+		"": "Rysunek PDF z otwartego modelu (rzuty, arkusz ISO, trzeci kąt). Bez importu i bez zapisu.",
+		"1045": "Rysunek PDF z otwartego modelu (rzuty, arkusz ISO, trzeci kąt). Bez importu i bez zapisu.",
+		"1033": "PDF drawing from the open design. No import and no save."
+	},
+	"version": "1.0.0",
+	"runOnStartup": false,
+	"supportedOS": "windows|mac",
+	"editEnabled": true
+}
