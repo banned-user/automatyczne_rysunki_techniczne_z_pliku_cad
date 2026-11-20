@@ -441,6 +441,55 @@ def _ensure_title_block(drawing, sheet, sheet_w, scale_text):
     return note + ' Nie udało się dodać pola SCALE.'
 
 
+def _read_view_attr(view, name):
+    try:
+        return True, getattr(view, name)
+    except Exception:
+        return False, None
+
+
+def _write_view_attr(view, name, value):
+    try:
+        setattr(view, name, value)
+        return True
+    except Exception:
+        return False
+
+
+def _sync_view_style(view, style):
+    """get_style na gotowym rzucie potrafi rzucić. Odczyt, który pada, pomija styl."""
+    readable, current = _read_view_attr(view, 'style')
+    if not readable:
+        return 'Nie odczytano stylu krawędzi. Styl pominięty, rzut zostaje.'
+    if current == style:
+        return None
+    if not _write_view_attr(view, 'style', style):
+        return 'API nie przyjęło zapisu stylu krawędzi.'
+    return None
+
+
+def _sync_view_tangent(view, tangent):
+    readable, current = _read_view_attr(view, 'tangentEdges')
+    if not readable or current == tangent:
+        return None
+    _write_view_attr(view, 'tangentEdges', tangent)
+    return None
+
+
+def _sync_view_scale(view, scale):
+    readable, current = _read_view_attr(view, 'scaleValue')
+    if not readable:
+        return None
+    try:
+        unchanged = abs((current or 0.0) - scale) <= 1e-6
+    except Exception:
+        return None
+    if unchanged:
+        return None
+    _write_view_attr(view, 'scaleValue', scale)
+    return None
+
+
 def _add_base_view(views, key, scale, style, tangent, x_cm, y_cm):
     view_input = views.createBaseViewInput()
     view_input.placementPoint = adsk.drawing.DrawingPoint.create(
@@ -455,14 +504,15 @@ def _add_base_view(views, key, scale, style, tangent, x_cm, y_cm):
     view = views.add(view_input)
     if not view:
         raise RuntimeError('Fusion nie dodał rzutu ({}).'.format(key))
-    # Właściwości gotowego rzutu mają inną nazwę krawędzi stycznych niż wejście.
-    if view.style != style:
-        view.style = style
-    if view.tangentEdges != tangent:
-        view.tangentEdges = tangent
-    if abs((view.scaleValue or 0.0) - scale) > 1e-6:
-        view.scaleValue = scale
-    return view
+    notes = []
+    for note in (
+        _sync_view_style(view, style),
+        _sync_view_tangent(view, tangent),
+        _sync_view_scale(view, scale),
+    ):
+        if note:
+            notes.append('{} ({}).'.format(note, key))
+    return notes
 
 
 def _pdf_stem(document):
@@ -751,15 +801,20 @@ def build_drawing(options):
         )
 
     for item in placed:
-        _add_base_view(
-            sheet.views,
-            item['key'],
-            scale,
-            style,
-            tangent,
-            item['x'],
-            item['y'],
-        )
+        try:
+            warnings.extend(_add_base_view(
+                sheet.views,
+                item['key'],
+                scale,
+                style,
+                tangent,
+                item['x'],
+                item['y'],
+            ))
+        except Exception as error:
+            warnings.append(
+                'Rzut {} nie został dokończony, PDF i tak powstanie: {}'.format(item['key'], error)
+            )
 
     scale_text = format_scale(scale)
     title_note = _ensure_title_block(drawing, sheet, sheet_w, scale_text)

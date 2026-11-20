@@ -73,6 +73,7 @@ Całe API rysunku jest oznaczone jako podgląd (wersje od lipca do października
 - Nie da się ustawić kąta rzutowania.
 - Tabelka: `TitleBlockAttributeParameter` ma nazwę i pozycję, nie treść. Jedyny znacznik podany w pomocy to `SCALE`. Skrypt nie wymyśla znaczników na nazwę pliku, numer arkusza ani datę. Zostawia tabelkę nowego rysunku ISO i, jeśli pola SCALE nie ma, próbuje je dodać. Szkic rysunkowy nie ma tekstu, tylko geometrię.
 - Arkusz powstaje tylko w `AutomaticDrawingCreationMode` (`CreateDrawingInput.creationMode`, domyślnie ten tryb). Pomoc nie ma osobnego typu `DrawingCreationOptions`. Tryb z placeholderami nie jest ustawiany. Gdyby `createDrawing` i tak zgłosiło błąd 3, komunikat wypisuje tryb odczytany z wejścia. Potem skrypt dokłada rzuty z okna. API nie usuwa rzutów, więc rzuty z automatycznego arkusza zostają.
+- Odczyt `view.style` (`get_style`) potrafi rzucić `failed to read view style` na rzucie z automatycznego arkusza. Skrypt wtedy nie czyta stylu dalej, nie przerywa rysunku i zapisuje PDF. Zapis stylu jest tylko wtedy, gdy odczyt się udał i API przyjęło przypisanie.
 - Ukryte kreski zależą od stylu widoku i od `hiddenLineLineType`. Wyglądu kresek (kreska krótka czy długa) nie sprawdzono na wydruku.
 - `Sheet.width` / `Sheet.height` nie podają jednostki. Skrypt poznaje mm, cm albo cale po porównaniu z wymiarem A4/A3/A2. Punkt rzutu jest w centymetrach, jak w opisie `placementPoint`.
 
