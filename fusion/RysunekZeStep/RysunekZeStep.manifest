@@ -1,0 +1,15 @@
+{
+	"autodeskProduct": "Fusion",
+	"type": "script",
+	"id": "",
+	"author": "",
+	"description": {
+		"": "Importuje plik STEP i zapisuje rysunek PDF (rzuty, arkusz ISO, trzeci kąt).",
+		"1045": "Importuje plik STEP i zapisuje rysunek PDF (rzuty, arkusz ISO, trzeci kąt).",
+		"1033": "Imports a STEP file and writes one PDF drawing."
+	},
+	"version": "1.0.0",
+	"runOnStartup": false,
+	"supportedOS": "windows|mac",
+	"editEnabled": true
+}
