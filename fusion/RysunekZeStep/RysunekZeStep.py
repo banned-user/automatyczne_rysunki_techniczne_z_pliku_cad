@@ -8,7 +8,6 @@ Skrypt korzysta z podglądowego API rysunków (DrawingManager, Views.add).
 Nie został uruchomiony w Fusion na maszynie, na której powstał.
 """
 
-import json
 import math
 import os
 import time
@@ -19,7 +18,6 @@ import adsk.drawing
 import adsk.fusion
 
 CMD_ID = 'RysunekZeStepCmd'
-EVENT_ID = 'RysunekZeStepJob'
 HANDLERS = []
 
 # Skale z szeregu ISO 5455, od największej. Wybierana jest największa, która
@@ -76,7 +74,8 @@ app = None
 ui = None
 dialog_state = {}
 pending_job = None
-job_started = False
+dialog_closed = False
+dialog_accepted = False
 
 
 def largest_standard_scale(max_scale):
@@ -231,19 +230,32 @@ def _message(text):
 
 
 def _finish():
-    global job_started
-    try:
-        app.unregisterCustomEvent(EVENT_ID)
-    except Exception:
-        pass
     try:
         command_def = ui.commandDefinitions.itemById(CMD_ID)
         if command_def:
             command_def.deleteMe()
     except Exception:
         pass
-    job_started = True
     adsk.terminate()
+
+
+def _require_cloud_project():
+    """Rysunek API bierze DataFile z chmury. Otwarty niezapisany dokument nie jest źródłem."""
+    project = None
+    folder = None
+    try:
+        project = app.data.activeProject
+        folder = project.rootFolder if project else None
+    except Exception:
+        project = None
+        folder = None
+    if not project or not folder:
+        raise ValueError(
+            'Brak aktywnego projektu Fusion. Zaloguj się i wybierz projekt.\n'
+            'Otwarty dokument „(Niezapisany)” nie jest plikiem STEP i nie musi być zapisany. '
+            'Skrypt zakłada nowy model ze wskazanego pliku i zapisuje go w projekcie, '
+            'bo rysunek da się utworzyć tylko z modelu w chmurze.'
+        )
 
 
 def _read_options():
@@ -267,6 +279,8 @@ def _read_options():
         raise ValueError('Nieznana szczegółowość.')
     if sheet_item.name not in SHEET_LABELS:
         raise ValueError('Nieznany arkusz.')
+
+    _require_cloud_project()
 
     return {
         'step': path,
@@ -547,11 +561,13 @@ def build_drawing(options):
         select_command = ui.commandDefinitions.itemById('SelectCommand')
         if select_command:
             select_command.execute()
+            adsk.doEvents()
 
     step_path = options['step']
     _message(
         'Importuję STEP i tworzę rysunek.\n'
-        'Po kliknięciu OK poczekaj na kolejne okno. Zapis modelu idzie do projektu Fusion.'
+        'Otwarty, niezapisany dokument jest pomijany. Nowy model ze STEP zostanie zapisany '
+        'w aktywnym projekcie Fusion. Po kliknięciu OK poczekaj na kolejne okno.'
     )
 
     importer = app.importManager
@@ -650,8 +666,9 @@ class CreatedHandler(adsk.core.CommandCreatedEventHandler):
                 'wstep',
                 '',
                 'Import STEP do nowego modelu, rysunek ISO i jeden PDF obok pliku STEP. '
+                'Otwarty, niezapisany dokument jest pomijany. '
                 'Bez przekrojów, tolerancji geometrycznych i listy części.',
-                3,
+                4,
                 True,
             )
 
@@ -753,41 +770,26 @@ class DestroyHandler(adsk.core.CommandEventHandler):
         super().__init__()
 
     def notify(self, args):
-        global job_started
+        global dialog_closed, dialog_accepted
         try:
             reason = adsk.core.CommandEventArgs.cast(args).terminationReason
-            completed = reason == adsk.core.CommandTerminationReason.CompletedTerminationReason
-            if completed and pending_job and not job_started:
-                job_started = True
-                if not app.fireCustomEvent(EVENT_ID, json.dumps(pending_job)):
-                    _message('Nie udało się uruchomić tworzenia rysunku po zamknięciu okna.')
-                    _finish()
-                return
+            dialog_accepted = (
+                reason == adsk.core.CommandTerminationReason.CompletedTerminationReason
+                and pending_job is not None
+            )
         except Exception:
+            dialog_accepted = False
             _message('Błąd przy zamykaniu okna:\n{}'.format(traceback.format_exc()))
-        _finish()
-
-
-class JobHandler(adsk.core.CustomEventHandler):
-    def __init__(self):
-        super().__init__()
-
-    def notify(self, args):
-        try:
-            raw = adsk.core.CustomEventArgs.cast(args).additionalInfo
-            options = json.loads(raw)
-            build_drawing(options)
-        except Exception:
-            _message('Nie udało się utworzyć rysunku:\n{}'.format(traceback.format_exc()))
-        _finish()
+        dialog_closed = True
 
 
 def run(_context):
-    global app, ui, pending_job, job_started
+    global app, ui, pending_job, dialog_closed, dialog_accepted
     app = adsk.core.Application.get()
     ui = app.userInterface if app else None
     pending_job = None
-    job_started = False
+    dialog_closed = False
+    dialog_accepted = False
     dialog_state.clear()
     try:
         if not app or not ui:
@@ -796,11 +798,6 @@ def run(_context):
         existing = ui.commandDefinitions.itemById(CMD_ID)
         if existing:
             existing.deleteMe()
-
-        custom_event = app.registerCustomEvent(EVENT_ID)
-        on_job = JobHandler()
-        custom_event.add(on_job)
-        HANDLERS.append(on_job)
 
         command_def = ui.commandDefinitions.addButtonDefinition(
             CMD_ID,
@@ -811,7 +808,24 @@ def run(_context):
         command_def.commandCreated.add(on_created)
         HANDLERS.append(on_created)
         command_def.execute()
+        # run() musi żyć do zamknięcia okna. Po powrocie z run() znika zdarzenie
+        # własne i fireCustomEvent zwraca fałsz, zanim import w ogóle ruszy.
         adsk.autoTerminate(False)
+        if not dialog_state.get('ready'):
+            dialog_closed = True
+        while not dialog_closed:
+            adsk.doEvents()
+            if dialog_closed:
+                break
+            time.sleep(0.05)
+        for _ in range(3):
+            adsk.doEvents()
+        if dialog_accepted and pending_job:
+            try:
+                build_drawing(pending_job)
+            except Exception:
+                _message('Nie udało się utworzyć rysunku:\n{}'.format(traceback.format_exc()))
+        _finish()
     except Exception:
         _message('Nie udało się uruchomić skryptu:\n{}'.format(traceback.format_exc()))
         _finish()

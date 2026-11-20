@@ -69,7 +69,7 @@ PDF powstaje obok STEP, z tą samą nazwą i rozszerzeniem `.pdf`. Gdy zapis si�
 Całe API rysunku jest oznaczone jako podgląd (wersje od lipca do października 2026). Autodesk pisze, że może się zmienić i nie należy na nim opierać programu oddawanego klientom. Innej, stabilnej metody wstawienia rzutów w tej pomocy nie ma.
 
 - Brak pola pliku w `CommandInputs`. Jest lista, pole tekstowe i przycisk oraz osobne `UserInterface.createFileDialog`.
-- Import i zapis dokumentu nie mogą iść wewnątrz zdarzenia polecenia. Po OK skrypt kolejkuje własne zdarzenie (`fireCustomEvent`) i pracę robi, gdy polecenie jest już zamknięte. W razie potrzeby przełącza aktywne polecenie na `SelectCommand`, tak jak w podręczniku wątków.
+- Import i zapis dokumentu nie mogą iść wewnątrz zdarzenia polecenia. Skrypt nie wraca z `run()`, dopóki okno jest otwarte (`adsk.doEvents`), i importuje STEP dopiero po zamknięciu OK. Wcześniejsze `fireCustomEvent` po powrocie z `run()` w ogóle nie startowało pracy. Otwarty dokument „(Niezapisany)” nie jest plikiem źródłowym. Brak aktywnego projektu Fusion jest zgłaszany w oknie, zanim się zamknie.
 - Rysunek wymaga modelu zapisanego w chmurze (`saveAs` do katalogu głównego aktywnego projektu, potem `dataFile`).
 - Nie ma tworzenia rzutu pochodnego, więc nie da się oddać układu trzeciego kąta samej fladze dokumentu.
 - Nie da się ustawić kąta rzutowania.
